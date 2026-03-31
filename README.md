@@ -112,6 +112,39 @@ docker run -d \
   ghcr.io/youyi0218/qunar-flight-alter:latest
 ```
 
+### Docker Compose 部署
+
+仓库已提供 `docker-compose.yml`，并把本地 `./data` 目录整体映射到容器 `/data`，用于持久化：
+
+- `config.json`
+- `cookie.json`
+- `.flight_monitor_history.json`
+- `.flight_monitor_state.json`
+
+首次部署：
+
+```bash
+mkdir -p data
+cp config.example.json data/config.json
+cp cookie.json data/cookie.json
+docker compose pull
+docker compose up -d
+```
+
+查看日志：
+
+```bash
+docker compose logs -f
+```
+
+停止：
+
+```bash
+docker compose down
+```
+
+如果你的环境使用旧版命令，也可以把 `docker compose` 改成 `docker-compose`。
+
 容器默认启动命令：
 
 ```bash

@@ -8,6 +8,7 @@ onebot-config.json
 temp_test_config.json
 .flight_monitor_history.json
 .flight_monitor_state.json
+data/
 
 # Debug / capture artifacts
 debug_*.html
