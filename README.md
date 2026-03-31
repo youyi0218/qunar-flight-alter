@@ -83,10 +83,8 @@ python flight_monitor.py --service
 ```bash
 docker build -t qunar-flight-alter .
 docker run --rm \
-  -v $(pwd)/config.json:/data/config.json \
-  -v $(pwd)/cookie.json:/data/cookie.json \
-  -v $(pwd)/.flight_monitor_history.json:/data/.flight_monitor_history.json \
-  -v $(pwd)/.flight_monitor_state.json:/data/.flight_monitor_state.json \
+  --user root \
+  -v $(pwd):/app \
   qunar-flight-alter
 ```
 
@@ -105,16 +103,16 @@ docker pull ghcr.io/youyi0218/qunar-flight-alter:latest
 docker run -d \
   --name qunar-flight-alter \
   --restart unless-stopped \
-  -v $(pwd)/config.json:/data/config.json \
-  -v $(pwd)/cookie.json:/data/cookie.json \
-  -v $(pwd)/.flight_monitor_history.json:/data/.flight_monitor_history.json \
-  -v $(pwd)/.flight_monitor_state.json:/data/.flight_monitor_state.json \
+  --user root \
+  -v $(pwd):/app \
   ghcr.io/youyi0218/qunar-flight-alter:latest
 ```
 
 ### Docker Compose 部署
 
-仓库已提供 `docker-compose.yml`，并把本地 `./data` 目录整体映射到容器 `/data`，用于持久化：
+仓库已提供 `docker-compose.yml`，会把**当前项目目录**整体映射到容器 `/app`。
+
+因此这些文件都会直接在项目根目录中读写，不再单独使用 `data/`：
 
 - `config.json`
 - `cookie.json`
@@ -124,9 +122,9 @@ docker run -d \
 首次部署：
 
 ```bash
-mkdir -p data
-cp config.example.json data/config.json
-cp cookie.json data/cookie.json
+cp config.example.json config.json
+# 再把你自己的 cookie.json 放到当前目录
+docker login ghcr.io -u youyi0218
 docker compose pull
 docker compose up -d
 ```
@@ -157,4 +155,3 @@ python /app/flight_monitor.py --service
 
 - `push`
 - `workflow_dispatch`
-

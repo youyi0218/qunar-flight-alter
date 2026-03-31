@@ -24,8 +24,8 @@ RUN apt-get update \
 
 # Create a non-root user (Chromium cannot run as root without --no-sandbox).
 RUN useradd -m -u 10001 -s /usr/sbin/nologin app \
-    && mkdir -p /app /data \
-    && chown -R app:app /app /data
+    && mkdir -p /app \
+    && chown -R app:app /app
 
 WORKDIR /app
 COPY requirements.txt ./
@@ -35,8 +35,8 @@ COPY flight_monitor.py ./
 
 USER app
 
-# Runtime working directory (mount config/state here).
-WORKDIR /data
+# Runtime working directory (mount the whole project here if desired).
+WORKDIR /app
 
 ENTRYPOINT ["dumb-init", "--"]
 CMD ["python", "/app/flight_monitor.py", "--service"]

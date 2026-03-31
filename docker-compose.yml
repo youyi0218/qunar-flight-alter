@@ -3,6 +3,7 @@ services:
     image: ghcr.io/youyi0218/qunar-flight-alter:latest
     container_name: qunar-flight-alter
     restart: unless-stopped
-    working_dir: /data
+    user: "0:0"
+    working_dir: /app
     volumes:
-      - ./data:/data
+      - ./:/app

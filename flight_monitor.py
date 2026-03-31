@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import html
 import json
+import os
 import re
 import sys
 import time
@@ -1131,10 +1132,13 @@ class QunarMonitor:
 
     async def __aenter__(self) -> "QunarMonitor":
         self.playwright = await async_playwright().start()
+        launch_args = ["--disable-blink-features=AutomationControlled"]
+        if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
+            launch_args.extend(["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"])
         self.browser = await self.playwright.chromium.launch(
             headless=bool(self.browser_cfg.get("headless", True)),
             executable_path=self.browser_path,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=launch_args,
         )
         self.context = await self.browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
