@@ -125,6 +125,14 @@ docker run -d \
 - `config.example.json`
 - `README.md`
 - `requirements.txt`
+- `docker-compose.yml`
+- `Dockerfile`
+- `.gitignore`
+- `.dockerignore`
+- `docker-entrypoint.sh`
+- `LICENSE`
+
+如果当前目录里没有 `config.json`，容器也会自动用 `config.example.json` 生成一份。
 
 首次部署：
 
@@ -134,10 +142,10 @@ docker compose pull
 docker compose up -d
 ```
 
-如果第一次启动后当前目录里还没有 `config.json`，就再执行：
+第一次启动后，你只需要：
 
 ```bash
-cp config.example.json config.json
+# 按需修改自动生成出来的 config.json
 # 再把你自己的 cookie.json 放到当前目录
 docker compose restart
 ```

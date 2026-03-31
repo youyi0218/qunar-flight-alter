@@ -31,7 +31,7 @@ WORKDIR /opt/qunar-flight-alter-seed
 COPY requirements.txt ./
 RUN python -m pip install -r requirements.txt
 
-COPY flight_monitor.py README.md config.example.json docker-entrypoint.sh ./
+COPY flight_monitor.py README.md config.example.json docker-compose.yml Dockerfile .gitignore .dockerignore docker-entrypoint.sh LICENSE ./
 RUN chmod +x /opt/qunar-flight-alter-seed/docker-entrypoint.sh
 
 USER app
@@ -40,5 +40,5 @@ USER app
 WORKDIR /app
 
 ENTRYPOINT ["dumb-init", "--", "/opt/qunar-flight-alter-seed/docker-entrypoint.sh"]
-CMD ["python", "/app/flight_monitor.py", "--service"]
+CMD ["python", "/app/flight_monitor.py", "--service", "--config", "/app/config.json"]
 
