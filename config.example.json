@@ -1,6 +1,9 @@
 {
-  // 去哪儿 cookie 文件路径
+  // 携程 cookie 文件路径（可选，不填也可抓取公开机票页）
   "cookie_file": "cookie.json",
+
+  // 携程机票 URL 文件路径；每行一个网页 URL，支持前面带“出发/到达/出发日期”说明文字
+  "url_file": "url.txt",
 
   // 定时服务状态文件
   "state_file": ".flight_monitor_state.json",
@@ -100,6 +103,8 @@
     ]
   },
 
+  // 可选：按航线覆盖预期价格/启用状态。
+  // 会优先按 source_url 匹配；没有 source_url 时，再按 出发城市+到达城市+出发日期 匹配 url.txt 中解析出的航线。
   "routes": [
     {
       // 出发城市

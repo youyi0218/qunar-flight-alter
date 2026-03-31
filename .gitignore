@@ -13,7 +13,8 @@ temp_test_config.json
 debug_*.html
 debug_*.png
 rendered_page.html
-sample_qunar.html
+sample_*.html
+sample_*.json
 domestic_oneway_new.js
 pushplustoken.txt
 url.txt

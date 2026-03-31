@@ -1,7 +1,7 @@
 services:
-  qunar-flight-alter:
-    image: ghcr.io/youyi0218/qunar-flight-alter:latest
-    container_name: qunar-flight-alter
+  ctrip-flight-alter:
+    image: ghcr.io/youyi0218/ctrip-flight-alter:latest
+    container_name: ctrip-flight-alter
     restart: unless-stopped
     user: "0:0"
     working_dir: /app

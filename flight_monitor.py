@@ -13,7 +13,7 @@ from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -34,7 +34,9 @@ DEFAULT_BROWSER_PATHS = [
     Path("/usr/bin/google-chrome-stable"),
 ]
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
-QUNAR_URL = "https://flight.qunar.com/site/oneway_list.htm"
+DEFAULT_URL_FILE = Path("url.txt")
+CTRIP_BATCH_SEARCH_KEYWORD = "/search/api/search/batchSearch"
+CTRIP_DOMESTIC_PATH_RE = re.compile(r"/oneway-([a-z]{3})-([a-z]{3})(?:$|[/?])", re.IGNORECASE)
 
 INIT_SCRIPT = r"""
 (() => {
@@ -51,51 +53,6 @@ INIT_SCRIPT = r"""
     Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
   } catch (_) {}
 
-  const state = {
-    requests: [],
-  };
-  window.__flightMonitor = state;
-
-  const captureResponse = (meta, status, responseText) => {
-    state.requests.push({
-      url: meta.url || '',
-      method: meta.method || '',
-      body: meta.body || '',
-      headers: meta.headers || {},
-      status: status || 0,
-      responseText: (responseText || '').slice(0, 5_000_000),
-      ts: Date.now(),
-    });
-  };
-
-  const originalOpen = XMLHttpRequest.prototype.open;
-  const originalSend = XMLHttpRequest.prototype.send;
-  const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
-
-  XMLHttpRequest.prototype.open = function(method, url) {
-    this.__flightMonitorMeta = { method, url, headers: {} };
-    return originalOpen.apply(this, arguments);
-  };
-
-  XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
-    if (this.__flightMonitorMeta) {
-      this.__flightMonitorMeta.headers[name] = value;
-    }
-    return originalSetRequestHeader.apply(this, arguments);
-  };
-
-  XMLHttpRequest.prototype.send = function(body) {
-    const meta = this.__flightMonitorMeta || { headers: {} };
-    meta.body = typeof body === 'string' ? body : '';
-    this.addEventListener('loadend', function() {
-      let responseText = '';
-      try {
-        responseText = this.responseText || '';
-      } catch (_) {}
-      captureResponse(meta, this.status, responseText);
-    });
-    return originalSend.apply(this, arguments);
-  };
 })();
 """
 
@@ -149,7 +106,7 @@ class ScheduleOccurrence:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="去哪儿机票价格监控与 PushPlus 推送")
+    parser = argparse.ArgumentParser(description="携程机票价格监控与 PushPlus 推送")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="配置文件路径")
     parser.add_argument("--dry-run", action="store_true", help="只抓取和打印，不发送 PushPlus")
     parser.add_argument("--dump-json", action="store_true", help="输出结构化 JSON 结果")
@@ -232,6 +189,7 @@ def ensure_config(path: Path) -> dict[str, Any]:
         raise ValueError("config.json 必须是 JSON 对象")
 
     config.setdefault("cookie_file", "cookie.json")
+    config.setdefault("url_file", str(DEFAULT_URL_FILE))
     config.setdefault("state_file", ".flight_monitor_state.json")
     config.setdefault("history_file", ".flight_monitor_history.json")
     config.setdefault("notify_empty_results", True)
@@ -285,8 +243,6 @@ def ensure_config(path: Path) -> dict[str, Any]:
     for route in config["routes"]:
         route.setdefault("expected_price", None)
         route.setdefault("enabled", True)
-    if not config["routes"]:
-        raise ValueError("config.json 中 routes 不能为空")
     return config
 
 
@@ -325,6 +281,8 @@ def detect_browser_executable(config: dict[str, Any]) -> str:
 
 
 def load_cookies(cookie_file: Path) -> list[dict[str, Any]]:
+    if not cookie_file or str(cookie_file) in {"", "."} or not cookie_file.exists() or not cookie_file.is_file():
+        return []
     cookies = load_json(cookie_file)
     if not isinstance(cookies, list):
         raise ValueError("cookie.json 必须是 JSON 数组")
@@ -355,13 +313,126 @@ def load_cookies(cookie_file: Path) -> list[dict[str, Any]]:
     return cleaned
 
 
-def build_qunar_url(route: dict[str, Any]) -> str:
-    params = {
-        "searchDepartureAirport": route["departure_city"],
-        "searchArrivalAirport": route["arrival_city"],
-        "searchDepartureTime": route["departure_date"],
+def extract_url_from_text(text: str) -> str:
+    match = re.search(r"https?://\S+", text)
+    if not match:
+        raise ValueError(f"未在文本中找到有效 URL: {text}")
+    return match.group(0).strip()
+
+
+def parse_prefixed_route_text(text: str) -> dict[str, str]:
+    prefix = text.split("http", 1)[0]
+    info: dict[str, str] = {}
+    patterns = {
+        "departure_city": r"出发[:：]\s*([^\s]+)",
+        "arrival_city": r"到达[:：]\s*([^\s]+)",
+        "departure_date_text": r"出发日期[:：]\s*([^\s]+)",
     }
-    return f"{QUNAR_URL}?{urlencode(params)}"
+    for key, pattern in patterns.items():
+        match = re.search(pattern, prefix)
+        if match:
+            info[key] = match.group(1).strip()
+    return info
+
+
+def parse_ctrip_url(url: str) -> dict[str, Any]:
+    parsed = urlparse(url.strip())
+    host = parsed.netloc.lower()
+    if "ctrip.com" not in host and "trip.com" not in host:
+        raise ValueError(f"不是携程机票链接: {url}")
+    match = CTRIP_DOMESTIC_PATH_RE.search(parsed.path)
+    if not match:
+        raise ValueError(f"暂不支持的携程机票链接格式: {url}")
+    query = parse_qs(parsed.query)
+    departure_date = (query.get("depdate") or [""])[0].strip()
+    if not departure_date:
+        raise ValueError(f"携程链接缺少 depdate 参数: {url}")
+    return {
+        "source_url": url.strip(),
+        "departure_city_code": match.group(1).upper(),
+        "arrival_city_code": match.group(2).upper(),
+        "departure_date": departure_date,
+    }
+
+
+def build_route_match_keys(route: dict[str, Any]) -> list[str]:
+    keys: list[str] = []
+    url = str(route.get("source_url") or route.get("url") or "").strip()
+    if url:
+        keys.append(f"url:{url}")
+    departure_date = str(route.get("departure_date") or "").strip()
+    departure_city = str(route.get("departure_city") or "").strip()
+    arrival_city = str(route.get("arrival_city") or "").strip()
+    departure_code = str(route.get("departure_city_code") or "").strip().upper()
+    arrival_code = str(route.get("arrival_city_code") or "").strip().upper()
+    if departure_city and arrival_city and departure_date:
+        keys.append(f"city:{departure_city}|{arrival_city}|{departure_date}")
+    if departure_code and arrival_code and departure_date:
+        keys.append(f"code:{departure_code}|{arrival_code}|{departure_date}")
+    return keys
+
+
+def merge_route_overrides(base_routes: list[dict[str, Any]], overrides: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    override_map: dict[str, dict[str, Any]] = {}
+    for item in overrides:
+        if not isinstance(item, dict):
+            continue
+        for key in build_route_match_keys(item):
+            override_map[key] = item
+
+    merged_routes: list[dict[str, Any]] = []
+    for route in base_routes:
+        merged = dict(route)
+        matched: dict[str, Any] | None = None
+        for key in build_route_match_keys(route):
+            matched = override_map.get(key)
+            if matched:
+                break
+        if matched:
+            for field, value in matched.items():
+                if field in {"url", "source_url"}:
+                    continue
+                merged[field] = value
+        merged.setdefault("expected_price", None)
+        merged.setdefault("enabled", True)
+        merged_routes.append(merged)
+    return merged_routes
+
+
+def load_routes_from_url_file(config: dict[str, Any]) -> list[dict[str, Any]]:
+    url_path = Path(str(config.get("url_file") or DEFAULT_URL_FILE))
+    if not url_path.exists():
+        raise FileNotFoundError(f"未找到 URL 文件: {url_path}")
+
+    routes: list[dict[str, Any]] = []
+    for raw_line in url_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        route = parse_ctrip_url(extract_url_from_text(line))
+        route.update(parse_prefixed_route_text(line))
+        route.setdefault("expected_price", None)
+        route.setdefault("enabled", True)
+        routes.append(route)
+
+    if not routes:
+        raise ValueError(f"{url_path} 中未找到有效的携程机票链接")
+    return merge_route_overrides(routes, config.get("routes", []))
+
+
+def hydrate_route_from_search_request(route: dict[str, Any], request_payload: dict[str, Any]) -> None:
+    segments = request_payload.get("flightSegments") or []
+    segment = segments[0] if segments else {}
+    if not route.get("departure_city"):
+        route["departure_city"] = str(segment.get("departureCityName") or route.get("departure_city_code") or "").strip()
+    if not route.get("arrival_city"):
+        route["arrival_city"] = str(segment.get("arrivalCityName") or route.get("arrival_city_code") or "").strip()
+    if not route.get("departure_city_code"):
+        route["departure_city_code"] = str(segment.get("departureCityCode") or "").strip().upper()
+    if not route.get("arrival_city_code"):
+        route["arrival_city_code"] = str(segment.get("arrivalCityCode") or "").strip().upper()
+    if not route.get("departure_date"):
+        route["departure_date"] = str(segment.get("departureDate") or "").strip()
 
 
 def combine_airport(name: str | None, terminal: str | None) -> str:
@@ -657,6 +728,190 @@ def parse_display_tickets(route: dict[str, Any], rows: list[dict[str, Any]]) -> 
     return tickets
 
 
+def split_datetime_text(value: Any) -> tuple[str, str]:
+    text = str(value or "").strip()
+    if not text:
+        return "", ""
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+        return parsed.strftime("%Y-%m-%d"), parsed.strftime("%H:%M")
+    except ValueError:
+        pass
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%d %H:%M")
+        return parsed.strftime("%Y-%m-%d"), parsed.strftime("%H:%M")
+    except ValueError:
+        return "", ""
+
+
+def format_discount_rate(value: Any) -> str:
+    try:
+        rate = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if rate <= 0:
+        return ""
+    fold = rate * 10 if rate <= 1 else rate
+    fold = round(fold, 1)
+    if float(fold).is_integer():
+        return f"{int(fold)}折"
+    return f"{fold:.1f}折"
+
+
+def compute_transfer_duration_from_flights(flights: list[dict[str, Any]]) -> str:
+    durations: list[str] = []
+    for current, nxt in zip(flights, flights[1:]):
+        current_arrival = str(current.get("arrivalDateTime") or "").strip()
+        next_departure = str(nxt.get("departureDateTime") or "").strip()
+        if not current_arrival or not next_departure:
+            continue
+        try:
+            arr_dt = datetime.strptime(current_arrival, "%Y-%m-%d %H:%M:%S")
+            dep_dt = datetime.strptime(next_departure, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        gap_minutes = int((dep_dt - arr_dt).total_seconds() // 60)
+        if gap_minutes > 0:
+            durations.append(humanize_minutes(gap_minutes))
+    return " / ".join(durations)
+
+
+def extract_ctrip_price_labels(price: dict[str, Any]) -> tuple[str, list[str]]:
+    labels: list[str] = []
+    baggage_tag = str((price.get("baggage") or {}).get("baggageTag") or "").strip()
+    if baggage_tag:
+        labels.append(baggage_tag)
+
+    for tag in price.get("priceTags") or []:
+        if not isinstance(tag, dict):
+            continue
+        label = str(tag.get("label") or tag.get("title") or "").strip()
+        if label:
+            labels.append(label)
+
+    for unit in price.get("priceUnitList") or []:
+        if not isinstance(unit, dict):
+            continue
+        for seat in unit.get("flightSeatList") or []:
+            if not isinstance(seat, dict):
+                continue
+            special_name = str(seat.get("specialClassName") or "").strip()
+            if special_name:
+                labels.append(special_name)
+
+    discount = format_discount_rate(
+        next(
+            (
+                seat.get("discountRate")
+                for unit in price.get("priceUnitList") or []
+                if isinstance(unit, dict)
+                for seat in unit.get("flightSeatList") or []
+                if isinstance(seat, dict) and seat.get("discountRate") not in (None, "")
+            ),
+            None,
+        )
+    )
+    if discount:
+        labels.insert(0, discount)
+    return discount, dedupe_in_order(labels)
+
+
+def parse_ctrip_segment(flight: dict[str, Any]) -> FlightSegment:
+    departure_date, departure_time = split_datetime_text(flight.get("departureDateTime"))
+    arrival_date, arrival_time = split_datetime_text(flight.get("arrivalDateTime"))
+    arrival_day_offset = get_arrival_offset(departure_date, arrival_date)
+    airline_name = str(flight.get("marketAirlineName") or flight.get("operateAirlineName") or "").strip()
+    return FlightSegment(
+        airline=airline_name,
+        short_airline=airline_name,
+        flight_no=str(flight.get("flightNo") or "").strip(),
+        departure_date=departure_date,
+        departure_time=departure_time,
+        departure_airport=combine_airport(flight.get("departureAirportName"), flight.get("departureTerminal")),
+        arrival_date=arrival_date,
+        arrival_time=arrival_time,
+        arrival_airport=combine_airport(flight.get("arrivalAirportName"), flight.get("arrivalTerminal")),
+        flight_duration=humanize_minutes(int(flight.get("duration") or 0)) if flight.get("duration") else "",
+        arrival_day_note=format_day_offset(arrival_day_offset),
+        aircraft=str(flight.get("aircraftName") or "").strip(),
+    )
+
+
+def parse_ctrip_ticket(route: dict[str, Any], itinerary: dict[str, Any]) -> Ticket:
+    flight_segments = itinerary.get("flightSegments") or []
+    flight_group = flight_segments[0] if flight_segments else {}
+    flights = [item for item in flight_group.get("flightList") or [] if isinstance(item, dict)]
+    if not flights:
+        raise ValueError("未找到可解析的携程航班信息")
+
+    segments = [parse_ctrip_segment(item) for item in flights]
+    first = segments[0]
+    last = segments[-1]
+    arrival_day_offset = get_arrival_offset(first.departure_date, last.arrival_date)
+    best_price = min(
+        [item for item in itinerary.get("priceList") or [] if isinstance(item, dict) and item.get("adultPrice") not in (None, "")]
+        or [{}],
+        key=lambda item: float(item.get("adultPrice") or 10**9),
+    )
+    discount, labels = extract_ctrip_price_labels(best_price)
+    airlines = " / ".join(
+        dedupe_in_order(
+            [segment.airline for segment in segments if segment.airline]
+            or [str(flight_group.get("airlineName") or "").strip()]
+        )
+    )
+    flight_numbers = " / ".join([segment.flight_no for segment in segments if segment.flight_no])
+    transfer_count = int(flight_group.get("transferCount") or 0)
+    stop_count = int(flight_group.get("stopCount") or 0)
+    if transfer_count > 0 or len(segments) > 1:
+        flight_type = "中转"
+    elif stop_count > 0:
+        flight_type = "经停"
+    else:
+        flight_type = "直飞"
+    transfer_city = " / ".join(
+        dedupe_in_order(
+            [
+                str(flight.get("arrivalCityName") or "").strip()
+                for flight in flights[:-1]
+                if str(flight.get("arrivalCityName") or "").strip()
+            ]
+        )
+    )
+    transfer_duration = compute_transfer_duration_from_flights(flights)
+    total_duration = humanize_minutes(int(flight_group.get("duration") or 0)) if flight_group.get("duration") else compute_total_duration(segments)
+    return Ticket(
+        route=f"{route['departure_city']} → {route['arrival_city']}",
+        departure_city=route["departure_city"],
+        arrival_city=route["arrival_city"],
+        departure_date=first.departure_date,
+        arrival_date=last.arrival_date,
+        arrival_day_offset=arrival_day_offset,
+        flight_type=flight_type,
+        airlines=airlines,
+        flight_numbers=flight_numbers,
+        departure_time=first.departure_time,
+        arrival_time=last.arrival_time,
+        departure_airport=first.departure_airport,
+        arrival_airport=last.arrival_airport,
+        total_duration=total_duration,
+        flight_duration=compute_air_duration(segments),
+        transfer_city=transfer_city,
+        transfer_duration=transfer_duration,
+        price=int(float(best_price.get("adultPrice") or 0)),
+        discount=discount,
+        labels=labels,
+        segments=segments,
+    )
+
+
+def parse_ctrip_flights(route: dict[str, Any], payload: dict[str, Any]) -> list[Ticket]:
+    itineraries = payload.get("data", {}).get("flightItineraryList", [])
+    tickets = [parse_ctrip_ticket(route, item) for item in itineraries if isinstance(item, dict)]
+    tickets.sort(key=lambda item: (item.price, item.departure_time, item.arrival_time, item.flight_numbers))
+    return tickets
+
+
 def format_segment_line(segment: FlightSegment) -> str:
     aircraft = f"｜{segment.aircraft}" if segment.aircraft else ""
     arrive_suffix = f" {segment.arrival_day_note}" if segment.arrival_day_note else ""
@@ -830,7 +1085,7 @@ def build_single_ticket_html(
             </table>
             <div class="footer">
               <div><span class="meta-pill">{html_text(ticket.flight_type)}</span>{''.join(f"<span class='meta-pill'>{html_text(label)}</span>" for label in ticket.labels[:3])}</div>
-              <div>原始页面：<a href="{html_text(source_url)}">查看去哪儿</a></div>
+<div>原始页面：<a href="{html_text(source_url)}">查看携程</a></div>
             </div>
           </article>
         </section>
@@ -897,7 +1152,7 @@ def build_route_section(
       {header_html}
       {notice_html}
       {body_html}
-      <div class="route-source">原始页面：<a href="{html_text(source_url)}">查看去哪儿</a></div>
+<div class="route-source">原始页面：<a href="{html_text(source_url)}">查看携程</a></div>
     </section>
     """.strip()
 
@@ -1202,7 +1457,7 @@ def send_resend_email(email_cfg: dict[str, Any], subject: str, html_content: str
     return data
 
 
-class QunarMonitor:
+class CtripMonitor:
     def __init__(self, config: dict[str, Any], cookie_file: Path) -> None:
         self.config = config
         self.cookie_file = cookie_file
@@ -1212,7 +1467,7 @@ class QunarMonitor:
         self.playwright = None
         self.browser_cfg = config["browser"]
 
-    async def __aenter__(self) -> "QunarMonitor":
+    async def __aenter__(self) -> "CtripMonitor":
         self.playwright = await async_playwright().start()
         launch_args = ["--disable-blink-features=AutomationControlled"]
         if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -1231,8 +1486,9 @@ class QunarMonitor:
             },
         )
         await self.context.add_init_script(INIT_SCRIPT)
-        await self.context.route("**/*", self._handle_route)
-        await self.context.add_cookies(load_cookies(self.cookie_file))
+        cookies = load_cookies(self.cookie_file)
+        if cookies:
+            await self.context.add_cookies(cookies)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -1261,124 +1517,100 @@ class QunarMonitor:
             await route.abort()
             return
 
-        if self.browser_cfg.get("block_tracking", True):
-            blocked_keywords = [
-                "qreport.qunar.com/",
-                "log.flight.qunar.com/",
-                "pwapp.qunar.com/api/log/",
-                "security.qunar.com/api/gather/",
-                "user.qunar.com/mobile/feedback/querycfg.jsp",
-                "user.qunar.com/webapi/message/unreadtiplist",
-                "user.qunar.com/webapi/unpaycount.jsp",
-                "user.qunar.com/webapi/forcelogout.jsp",
-                "flightopdata.qunar.com/vataplan",
-                "lp.flight.qunar.com/api/dom/recommend/nearby_route",
-                "gw.flight.qunar.com/api/f/pricecalendar",
-            ]
-            if any(keyword in url for keyword in blocked_keywords):
-                await route.abort()
-                return
-
         await route.continue_()
-
-    async def _wait_for_flight_payload(self, page: Page) -> dict[str, Any]:
-        timeout_ms = int(self.browser_cfg.get("wait_timeout_ms", 25000))
-        poll_interval_ms = int(self.browser_cfg.get("poll_interval_ms", 500))
-        deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
-        latest_payload: dict[str, Any] | None = None
-
-        while asyncio.get_running_loop().time() < deadline:
-            logs = await page.evaluate(
-                "() => ((window.__flightMonitor && window.__flightMonitor.requests) || []).filter(item => item.url.includes('wbdflightlist'))"
-            )
-            for item in sorted(logs, key=lambda row: row.get("ts", 0), reverse=True):
-                try:
-                    payload = json.loads(item["responseText"])
-                except Exception:
-                    continue
-                latest_payload = payload
-                if int(payload.get("code", -1)) == 0:
-                    return payload
-            await page.wait_for_timeout(poll_interval_ms)
-
-        if latest_payload is not None:
-            return latest_payload
-        raise RuntimeError("未捕获到有效的 wbdflightlist 响应")
 
     async def _extract_visible_prices(self, page: Page) -> list[dict[str, Any]]:
         return await page.evaluate(
             """() => {
                 const clean = value => (value || '').replace(/[\\t\\r\\n]+/g, ' ').replace(/\\s+/g, ' ').trim();
-                const airportText = container => {
-                  if (!container) return '';
-                  return clean(Array.from(container.querySelectorAll('.airport span')).map(el => clean(el.textContent)).join(''));
-                };
-                return Array.from(document.querySelectorAll('.b-airfly')).map(card => {
-                const text = sel => {
-                  const el = card.querySelector(sel);
+                const text = (root, sel) => {
+                  const el = root.querySelector(sel);
                   return el ? clean(el.textContent || '') : '';
                 };
-                const texts = sel => Array.from(card.querySelectorAll(sel)).map(el => clean(el.textContent || '')).filter(Boolean);
-                const fix = card.querySelector('.fix_price');
-                const prc = card.querySelector('.prc');
-                let price = '';
-                if (fix) price = (fix.getAttribute('title') || '').trim();
-                if (!price && prc) {
-                  const aria = (prc.getAttribute('aria-label') || '');
-                  const nums = aria.replace(/\\D+/g, ' ').trim().split(/\\s+/).filter(Boolean);
-                  if (nums.length) price = nums[0];
-                }
-                const cardText = (card.innerText || '').toUpperCase();
-                const flightNumbers = Array.from(new Set(cardText.match(/\\b[A-Z0-9]{2,3}\\d{3,4}\\b/g) || []));
-                const airlineNames = texts('.col-airline .air span');
-                const labelTexts = texts('.vim .v');
-                const transferText = text('.trans .g-up-tips .t');
-                const transferCityMatch = transferText.match(/转\\s*(.+)/);
-                const segTransferText = texts('.seg.transfer').find(Boolean) || '';
-                const transferDurationMatch = segTransferText.match(/(?:转机时间|停留时间?)[:：]?\\s*(.+)$/);
-                const daycross = text('.sep-rt .daycross span');
+                const texts = (root, sel) => Array.from(root.querySelectorAll(sel)).map(el => clean(el.textContent || '')).filter(Boolean);
+                const airportText = container => {
+                  if (!container) return '';
+                  return clean(text(container, '.airport .name') + text(container, '.airport .terminal'));
+                };
+                return Array.from(document.querySelectorAll('.flight-item.domestic')).map(card => {
                 const fullText = clean(card.innerText || '');
+                const upperText = fullText.toUpperCase();
+                const flightNumbers = Array.from(new Set(upperText.match(/\\b[A-Z0-9]{2,3}\\d{3,4}\\b/g) || []));
+                const price = text(card, '.flight-price .price').replace(/\\D+/g, '');
+                const transferText = text(card, '.arrow-box [id^="transfer-text-"]');
+                const daycross = text(card, '.arrive-box .day');
                 return {
                   price,
-                  airlines: airlineNames.join(' / '),
+                  airlines: text(card, '.airline-name span') || text(card, '.airline'),
                   flight_numbers: flightNumbers.join('/'),
-                  departure_time: text('.sep-lf h2'),
-                  arrival_time: text('.sep-rt h2'),
-                  departure_airport: airportText(card.querySelector('.sep-lf')),
-                  arrival_airport: airportText(card.querySelector('.sep-rt')),
-                  range_text: text('.sep-ct .range'),
+                  departure_time: text(card, '.depart-box .time'),
+                  arrival_time: text(card, '.arrive-box .time'),
+                  departure_airport: airportText(card.querySelector('.depart-box')),
+                  arrival_airport: airportText(card.querySelector('.arrive-box')),
+                  range_text: '',
                   arrival_day_note: daycross,
-                  transfer_city: transferCityMatch ? clean(transferCityMatch[1]) : '',
-                  transfer_duration: transferDurationMatch ? clean(transferDurationMatch[1]) : '',
-                  discount: labelTexts[0] || '',
-                  labels: labelTexts,
-                  flight_type: fullText.includes('经停') ? '经停' : (flightNumbers.length > 1 || transferText ? '中转' : '直飞')
+                  transfer_city: '',
+                  transfer_duration: '',
+                  discount: text(card, '.sub-price-item'),
+                  labels: texts(card, '.flight-tags .tag'),
+                  flight_type: fullText.includes('经停') ? '经停' : ((flightNumbers.length > 1 || /中转|转机/.test(transferText)) ? '中转' : '直飞')
                 };
             })}"""
         )
 
-    async def _collect_display_prices(self, page: Page) -> list[dict[str, Any]]:
-        total_pages = await page.evaluate(
-            "() => Array.from(document.querySelectorAll('.m-page .page, .m-page .curr')).map(el => (el.textContent || '').trim()).filter(t => /^\\d+$/.test(t)).length || 1"
-        )
-        result: list[dict[str, Any]] = []
-        for page_no in range(1, int(total_pages) + 1):
-            if page_no > 1:
-                await page.click(f'.m-page .page[data-pager-pageno=\"{page_no}\"]')
-                await page.wait_for_timeout(800)
-            result.extend(await self._extract_visible_prices(page))
-        return result
+    async def _collect_display_prices(self, page: Page, target_count: int = 0) -> list[dict[str, Any]]:
+        collected: dict[str, dict[str, Any]] = {}
+        stale_rounds = 0
+        for _ in range(20):
+            rows = await self._extract_visible_prices(page)
+            before = len(collected)
+            for row in rows:
+                if not str(row.get("price") or "").isdigit():
+                    continue
+                key = "|".join(
+                    [
+                        normalize_flight_numbers(row.get("flight_numbers", "")),
+                        str(row.get("departure_time") or "").strip(),
+                        str(row.get("arrival_time") or "").strip(),
+                    ]
+                )
+                if key and key.count("|") == 2:
+                    collected[key] = row
+            if target_count and len(collected) >= target_count:
+                break
+            scroll_y = await page.evaluate("window.scrollY")
+            max_scroll_y = await page.evaluate("Math.max(document.documentElement.scrollHeight - window.innerHeight, 0)")
+            await page.evaluate("window.scrollBy(0, Math.max(window.innerHeight * 0.9, 700))")
+            await page.wait_for_timeout(900)
+            new_scroll_y = await page.evaluate("window.scrollY")
+            if len(collected) == before and (new_scroll_y <= scroll_y or new_scroll_y >= max_scroll_y):
+                stale_rounds += 1
+                if stale_rounds >= 3:
+                    break
+            else:
+                stale_rounds = 0
+        return list(collected.values())
 
     async def _fetch_route_payload_once(self, route: dict[str, Any]) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
         if not self.context:
             raise RuntimeError("浏览器上下文未初始化")
         page = await self.context.new_page()
-        url = build_qunar_url(route)
+        url = str(route["source_url"])
         try:
-            await page.goto(url, wait_until="commit", timeout=60000)
-            payload = await self._wait_for_flight_payload(page)
+            timeout_ms = max(60000, int(self.browser_cfg.get("wait_timeout_ms", 25000)) * 2)
+            async with page.expect_response(lambda response: CTRIP_BATCH_SEARCH_KEYWORD in response.url, timeout=timeout_ms) as response_info:
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            response = await response_info.value
+            request_payload = json.loads(response.request.post_data or "{}")
+            hydrate_route_from_search_request(route, request_payload)
+            payload = json.loads(await response.text())
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
             await page.wait_for_timeout(1200)
-            display_prices = await self._collect_display_prices(page)
+            target_count = len(payload.get("data", {}).get("flightItineraryList", []))
+            display_prices = await self._collect_display_prices(page, target_count=target_count)
             return url, payload, display_prices
         finally:
             await page.close()
@@ -1389,7 +1621,7 @@ class QunarMonitor:
         for attempt in range(1, attempts + 1):
             last_result = await self._fetch_route_payload_once(route)
             _, payload, display_prices = last_result
-            if int(payload.get("code", -1)) == 0 and display_prices:
+            if int(payload.get("status", -1)) == 0:
                 return last_result
             if attempt < attempts:
                 await asyncio.sleep(0.8 * attempt)
@@ -1663,29 +1895,45 @@ def filter_tickets_for_route(route: dict[str, Any], tickets: list[Ticket]) -> li
     return [ticket for ticket in tickets if ticket.price <= limit]
 
 
+def apply_display_row(ticket: Ticket, row: dict[str, Any]) -> None:
+    if str(row.get("price") or "").isdigit():
+        ticket.price = int(row["price"])
+    airline = str(row.get("airlines") or "").strip()
+    if airline:
+        ticket.airlines = airline
+    discount = str(row.get("discount") or "").strip()
+    if discount:
+        ticket.discount = discount
+    labels = dedupe_in_order([str(item).strip() for item in (row.get("labels") or []) if str(item).strip()])
+    if discount and discount not in labels:
+        labels.insert(0, discount)
+    if labels:
+        ticket.labels = labels
+
+
 def apply_display_prices(tickets: list[Ticket], display_rows: list[dict[str, Any]]) -> None:
-    ordered_prices = [int(row["price"]) for row in display_rows if str(row.get("price") or "").isdigit()]
-    if len(ordered_prices) == len(tickets):
-        for ticket, price in zip(tickets, ordered_prices):
-            ticket.price = price
-    else:
-        display_prices: dict[str, int] = {}
-        for row in display_rows:
-            if not str(row.get("price") or "").isdigit():
-                continue
-            key = "|".join(
-                [
-                    normalize_flight_numbers(row.get("flight_numbers", "")),
-                    str(row.get("departure_time") or "").strip(),
-                    str(row.get("arrival_time") or "").strip(),
-                ]
-            )
-            if key and key.count("|") == 2:
-                display_prices[key] = int(row["price"])
-        for ticket in tickets:
-            key = ticket_lookup_key(ticket)
-            if key in display_prices:
-                ticket.price = int(display_prices[key])
+    ordered_rows = [row for row in display_rows if str(row.get("price") or "").isdigit()]
+    display_map: dict[str, dict[str, Any]] = {}
+    for row in ordered_rows:
+        key = "|".join(
+            [
+                normalize_flight_numbers(row.get("flight_numbers", "")),
+                str(row.get("departure_time") or "").strip(),
+                str(row.get("arrival_time") or "").strip(),
+            ]
+        )
+        if key and key.count("|") == 2:
+            display_map[key] = row
+
+    for ticket in tickets:
+        key = ticket_lookup_key(ticket)
+        row = display_map.get(key)
+        if row:
+            apply_display_row(ticket, row)
+
+    if len(ordered_rows) == len(tickets):
+        for ticket, row in zip(tickets, ordered_rows):
+            apply_display_row(ticket, row)
     tickets.sort(key=lambda item: (item.price, item.departure_time, item.arrival_time, item.flight_numbers))
 
 
@@ -1753,9 +2001,9 @@ def mark_slot_sent(state: dict[str, Any], slot_key: str) -> None:
 
 
 def validate_runtime_config(config: dict[str, Any]) -> None:
-    cookie_file = Path(config["cookie_file"])
-    if not cookie_file.exists():
-        raise FileNotFoundError(f"未找到 cookie 文件: {cookie_file}")
+    url_file = Path(str(config.get("url_file") or DEFAULT_URL_FILE))
+    if not url_file.exists():
+        raise FileNotFoundError(f"未找到 URL 文件: {url_file}")
     push_cfg = config["pushplus"]
     if not push_cfg.get("token"):
         raise ValueError("config.json 中 pushplus.token 不能为空")
@@ -1763,7 +2011,7 @@ def validate_runtime_config(config: dict[str, Any]) -> None:
 
 async def collect_route_results(
     config: dict[str, Any],
-    monitor: QunarMonitor,
+    monitor: CtripMonitor,
     history: dict[str, Any],
     current_time: datetime,
 ) -> list[dict[str, Any]]:
@@ -1772,19 +2020,20 @@ async def collect_route_results(
         if not route.get("enabled", True):
             continue
         url, payload, display_rows = await monitor.fetch_route_payload(route)
-        code = int(payload.get("code", -1))
-        if code == 0:
-            tickets = parse_flights(route, payload)
-            apply_display_prices(tickets, display_rows)
+        status = int(payload.get("status", -1))
+        if status == 0:
+            tickets = parse_ctrip_flights(route, payload)
+            if display_rows:
+                apply_display_prices(tickets, display_rows)
         elif display_rows:
             safe_output(
-                f"警告：去哪儿接口返回 code={code}，已自动切换为页面 DOM 兜底解析："
+                f"警告：携程接口返回 status={status}，已自动切换为页面 DOM 兜底解析："
                 f"{route['departure_city']} -> {route['arrival_city']} {route['departure_date']}"
             )
             tickets = parse_display_tickets(route, display_rows)
         else:
             safe_output(
-                f"警告：去哪儿接口返回 code={code}，且页面未解析到机票卡片，按空结果处理："
+                f"警告：携程接口返回 status={status}，且页面未解析到机票卡片，按空结果处理："
                 f"{route['departure_city']} -> {route['arrival_city']} {route['departure_date']}"
             )
             tickets = []
@@ -1879,12 +2128,13 @@ def push_contents(push_cfg: dict[str, Any], title: str, contents: list[str]) -> 
 
 async def run_monitor(config: dict[str, Any], dry_run: bool, dump_json: bool) -> list[dict[str, Any]]:
     validate_runtime_config(config)
+    config["routes"] = load_routes_from_url_file(config)
     history_file = Path(config.get("history_file", ".flight_monitor_history.json"))
     history = load_history(history_file)
     onebot_cfg = load_onebot_config()
     current_time = now_in_timezone(config)
 
-    async with QunarMonitor(config, Path(config["cookie_file"])) as monitor:
+    async with CtripMonitor(config, Path(str(config.get("cookie_file") or ""))) as monitor:
         route_results = await collect_route_results(config, monitor, history, current_time)
 
     summary_title = current_title(current_time)
@@ -1938,6 +2188,7 @@ async def run_monitor(config: dict[str, Any], dry_run: bool, dump_json: bool) ->
 
 async def run_service(config: dict[str, Any], dry_run: bool, dump_json: bool) -> None:
     validate_runtime_config(config)
+    config["routes"] = load_routes_from_url_file(config)
     service_cfg = config.get("service", {})
     onebot_cfg = load_onebot_config()
     email_cfg = config.get("email", {})
@@ -1956,7 +2207,7 @@ async def run_service(config: dict[str, Any], dry_run: bool, dump_json: bool) ->
     slot_snapshots: dict[str, list[dict[str, Any]]] = {}
     captured_slot_keys: set[str] = set()
 
-    async with QunarMonitor(config, Path(config["cookie_file"])) as monitor:
+    async with CtripMonitor(config, Path(str(config.get("cookie_file") or ""))) as monitor:
         while True:
             now = now_in_timezone(config)
             cleanup_sent_slots(state, config)
