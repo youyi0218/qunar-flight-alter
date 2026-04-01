@@ -4,7 +4,7 @@ A Ctrip-based flight price monitor. You only need to fill routes in `config.json
 
 ## Features
 
-- Config-only workflow; no `url.txt` maintenance
+- Config-only workflow; define routes only in `config.json`
 - Supports exported cookie.json login cookies for full itinerary crawling; if cookies are missing or expired, the program falls back automatically
 - Auto-resolves Ctrip domestic city code and city ID from the live site
 - Builds the Ctrip one-way list URL from `departure_city`, `arrival_city`, and `departure_date`

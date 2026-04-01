@@ -22,7 +22,6 @@ config.json
 cookie.json
 onebot-config.json
 pushplustoken.txt
-url.txt
 temp_test_config.json
 .flight_monitor_state.json
 .flight_monitor_history.json
@@ -32,6 +31,7 @@ temp_test_config.json
 *.jpg
 *.jpeg
 *.html
+.tmp/
 
 # OS
 .DS_Store
