@@ -21,6 +21,7 @@ from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 DEFAULT_CONFIG_PATH = Path("config.json")
 DEFAULT_ONEBOT_CONFIG_PATH = Path("onebot-config.json")
+DEFAULT_COOKIE_PATH = Path("cookie.json")
 DEFAULT_BROWSER_PATHS = [
     Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
     Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
@@ -35,6 +36,7 @@ DEFAULT_BROWSER_PATHS = [
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
 CTRIP_HOME_URL = "https://flights.ctrip.com/online/channel/domestic"
 CTRIP_BATCH_SEARCH_KEYWORD = "/search/api/search/batchSearch"
+CTRIP_REPO_LOWEST_PRICE_URL = "https://flights.ctrip.com/itinerary/api/12808/lowestPrice"
 CTRIP_LOWEST_PRICE_URL = "https://m.ctrip.com/restapi/soa2/15380/bjjson/FlightIntlAndInlandLowestPriceSearch"
 CTRIP_CITY_SELECTOR_REMARK_RE = re.compile(
     r"选择城市\[(?P<display>[^|]+)\|(?P<label>[^|]+)\((?P<code>[A-Z]{3})\)\|(?P<city_id>\d+)\|(?P<url_code>[A-Z]{3})\]"
@@ -247,6 +249,77 @@ def safe_output(text: str) -> None:
     sys.stdout.flush()
 
 
+def normalize_cookie_same_site(value: Any) -> str | None:
+    raw = str(value or "").strip().lower()
+    mapping = {
+        "lax": "Lax",
+        "strict": "Strict",
+        "none": "None",
+        "no_restriction": "None",
+    }
+    return mapping.get(raw)
+
+
+def load_cookie_file(path: Path = DEFAULT_COOKIE_PATH) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    raw = load_json(path)
+    if isinstance(raw, dict) and isinstance(raw.get("cookies"), list):
+        raw = raw["cookies"]
+    if not isinstance(raw, list):
+        raise ValueError(f"{path} 必须是浏览器导出的 Cookie JSON 数组")
+
+    cookies: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        value = str(item.get("value") or "")
+        domain = str(item.get("domain") or "").strip()
+        if not name or not domain:
+            continue
+        cookie: dict[str, Any] = {
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": str(item.get("path") or "/"),
+            "httpOnly": bool(item.get("httpOnly", False)),
+            "secure": bool(item.get("secure", False)),
+        }
+        same_site = normalize_cookie_same_site(item.get("sameSite"))
+        if same_site:
+            cookie["sameSite"] = same_site
+        expires = item.get("expirationDate")
+        if expires not in (None, "", 0, 0.0):
+            try:
+                cookie["expires"] = float(expires)
+            except (TypeError, ValueError):
+                pass
+        cookies.append(cookie)
+    return cookies
+
+
+def build_ctrip_requests_session(cookies: list[dict[str, Any]]) -> requests.Session:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json, text/plain, */*",
+        }
+    )
+    for cookie in cookies:
+        session.cookies.set(
+            cookie["name"],
+            cookie["value"],
+            domain=cookie.get("domain"),
+            path=cookie.get("path", "/"),
+        )
+    return session
+
+
 def ensure_config(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"未找到配置文件: {path}")
@@ -379,6 +452,16 @@ def build_ctrip_url(route: dict[str, Any]) -> str:
     )
 
 
+def build_ctrip_repo_lowest_price_params(route: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "flightWay": "Oneway",
+        "dcity": str(route["departure_city_code"]).strip().upper(),
+        "acity": str(route["arrival_city_code"]).strip().upper(),
+        "direct": "false",
+        "army": "false",
+    }
+
+
 def build_ctrip_lowest_price_payload(route: dict[str, Any]) -> dict[str, Any]:
     return {
         "departNewCityCode": str(route["departure_city_code"]).strip().upper(),
@@ -402,6 +485,10 @@ def parse_ctrip_ms_date(value: Any) -> str:
     except (ValueError, OSError):
         return ""
     return dt.strftime("%Y-%m-%d")
+
+
+def departure_day_key(route: dict[str, Any]) -> str:
+    return str(route.get("departure_date") or "").replace("-", "").strip()
 
 
 def combine_airport(name: str | None, terminal: str | None) -> str:
@@ -881,7 +968,61 @@ def parse_ctrip_flights(route: dict[str, Any], payload: dict[str, Any]) -> list[
     return tickets
 
 
-def parse_ctrip_lowest_price_tickets(route: dict[str, Any], payload: dict[str, Any]) -> list[Ticket]:
+def build_ctrip_lowest_price_ticket(
+    route: dict[str, Any],
+    price: int,
+    total_price: int | None = None,
+    extra_labels: list[str] | None = None,
+) -> Ticket:
+    labels = ["日历最低价", "仅含日期价格，不含具体航班"]
+    if extra_labels:
+        labels.extend(extra_labels)
+    if total_price and total_price != price:
+        labels.append(f"含税约￥{total_price}")
+    return Ticket(
+        route=f"{route['departure_city']} → {route['arrival_city']}",
+        departure_city=route["departure_city"],
+        arrival_city=route["arrival_city"],
+        departure_date=str(route.get("departure_date") or "").strip(),
+        arrival_date=str(route.get("departure_date") or "").strip(),
+        arrival_day_offset=0,
+        flight_type="日历最低价",
+        airlines="携程日历价",
+        flight_numbers="LOWEST-PRICE",
+        departure_time="--:--",
+        arrival_time="--:--",
+        departure_airport=route["departure_city"],
+        arrival_airport=route["arrival_city"],
+        total_duration="",
+        flight_duration="",
+        transfer_city="",
+        transfer_duration="",
+        price=price,
+        discount="",
+        labels=dedupe_in_order([label for label in labels if label]),
+        segments=[],
+    )
+
+
+def extract_ctrip_repo_lowest_price(route: dict[str, Any], payload: dict[str, Any]) -> int | None:
+    price_rows = ((payload.get("data") or {}).get("oneWayPrice") or [])
+    if not price_rows or not isinstance(price_rows[0], dict):
+        return None
+    day_key = departure_day_key(route)
+    raw_price = price_rows[0].get(day_key)
+    if raw_price in (None, ""):
+        return None
+    try:
+        return int(round(float(raw_price)))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_ctrip_lowest_price_tickets(
+    route: dict[str, Any],
+    payload: dict[str, Any],
+    price_override: int | None = None,
+) -> list[Ticket]:
     target_date = str(route.get("departure_date") or "").strip()
     tickets: list[Ticket] = []
     for item in payload.get("priceList") or []:
@@ -894,10 +1035,11 @@ def parse_ctrip_lowest_price_tickets(route: dict[str, Any], payload: dict[str, A
         if base_price_raw in (None, ""):
             base_price_raw = item.get("price")
         try:
-            price = int(round(float(base_price_raw)))
+            base_price = int(round(float(base_price_raw)))
         except (TypeError, ValueError):
             continue
 
+        price = price_override if price_override is not None else base_price
         total_price: int | None = None
         try:
             if item.get("totalPrice") not in (None, ""):
@@ -905,51 +1047,38 @@ def parse_ctrip_lowest_price_tickets(route: dict[str, Any], payload: dict[str, A
         except (TypeError, ValueError):
             total_price = None
 
-        labels = ["日历最低价", "仅含日期价格，不含具体航班"]
+        labels: list[str] = []
         direct_text = str(item.get("directCalendarText") or "").strip()
         if direct_text:
             labels.append(direct_text)
-        if total_price and total_price != price:
-            labels.append(f"含税约￥{total_price}")
-
-        tickets.append(
-            Ticket(
-                route=f"{route['departure_city']} → {route['arrival_city']}",
-                departure_city=route["departure_city"],
-                arrival_city=route["arrival_city"],
-                departure_date=target_date,
-                arrival_date=target_date,
-                arrival_day_offset=0,
-                flight_type="日历最低价",
-                airlines="携程日历价",
-                flight_numbers="LOWEST-PRICE",
-                departure_time="--:--",
-                arrival_time="--:--",
-                departure_airport=route["departure_city"],
-                arrival_airport=route["arrival_city"],
-                total_duration="",
-                flight_duration="",
-                transfer_city="",
-                transfer_duration="",
-                price=price,
-                discount="",
-                labels=dedupe_in_order(labels),
-                segments=[],
-            )
-        )
+        tickets.append(build_ctrip_lowest_price_ticket(route, price=price, total_price=total_price, extra_labels=labels))
     tickets.sort(key=lambda item: (item.price, item.departure_time, item.arrival_time, item.flight_numbers))
     return tickets
 
 
-def fetch_ctrip_lowest_price_payload(route: dict[str, Any]) -> dict[str, Any]:
-    response = requests.post(
+def fetch_ctrip_repo_lowest_price_payload(route: dict[str, Any], session: requests.Session | None = None) -> dict[str, Any]:
+    client = session or requests.Session()
+    response = client.get(
+        CTRIP_REPO_LOWEST_PRICE_URL,
+        params=build_ctrip_repo_lowest_price_params(route),
+        headers={
+            "Referer": str(route.get("source_url") or CTRIP_HOME_URL),
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_ctrip_lowest_price_payload(
+    route: dict[str, Any],
+    session: requests.Session | None = None,
+) -> dict[str, Any]:
+    client = session or requests.Session()
+    response = client.post(
         CTRIP_LOWEST_PRICE_URL,
         json=build_ctrip_lowest_price_payload(route),
         headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-            ),
             "Referer": str(route.get("source_url") or CTRIP_HOME_URL),
             "Content-Type": "application/json",
         },
@@ -1120,15 +1249,16 @@ def build_single_ticket_html(
       <title>{html_text(title)}</title>
       <style>
         :root{{--bg:#f6f8fc;--card:#fff;--line:#e6ebf5;--text:#18212f;--muted:#667085;--brand:#2563eb;--accent:#f97316;--shadow:0 12px 30px rgba(15,23,42,.08)}}
-        *{{box-sizing:border-box}}body{{margin:0;background:linear-gradient(180deg,#edf4ff 0%,var(--bg) 32%,var(--bg) 100%);color:var(--text);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}}
-        .wrap{{width:min(1080px,calc(100vw - 18px));margin:0 auto;padding:12px 0 22px}}
+        html,body{{width:100%;margin:0;padding:0}}
+        *{{box-sizing:border-box}}body{{background:linear-gradient(180deg,#edf4ff 0%,var(--bg) 32%,var(--bg) 100%);color:var(--text);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}}
+        .wrap{{width:100%;max-width:980px;margin:0 auto;padding:12px 12px 22px}}
         .hero{{background:linear-gradient(135deg,#1d4ed8,#2563eb 58%,#60a5fa);color:#fff;border-radius:24px;padding:20px;box-shadow:var(--shadow)}}
-        .hero h1{{margin:0;font-size:clamp(24px,6vw,42px);line-height:1.05;letter-spacing:.5px}}
-        .hero .route{{margin-top:8px;font-size:clamp(18px,4vw,28px);font-weight:800}}
+        .hero h1{{margin:0;font-size:40px;line-height:1.05;letter-spacing:.5px}}
+        .hero .route{{margin-top:8px;font-size:28px;font-weight:800}}
         .hero .sub{{margin-top:8px;font-size:13px;opacity:.95}}
-        .layout{{display:grid;grid-template-columns:1.2fr .9fr;gap:14px;margin-top:14px}}
+        .layout{{display:flex;flex-direction:column;gap:14px;margin-top:14px}}
         .card{{background:var(--card);border:1px solid var(--line);border-radius:22px;padding:16px;box-shadow:var(--shadow)}}
-        .price{{font-size:clamp(34px,7vw,48px);font-weight:900;color:var(--accent);line-height:1}}
+        .price{{font-size:48px;font-weight:900;color:var(--accent);line-height:1}}
         .grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 14px;margin-top:14px}}
         .item{{padding:10px 0;border-bottom:1px dashed var(--line)}}
         .label{{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}}
@@ -1141,8 +1271,8 @@ def build_single_ticket_html(
         .meta-pill{{display:inline-block;padding:7px 10px;border-radius:999px;background:#eef4ff;color:var(--brand);font-size:12px;font-weight:700;margin-right:8px;margin-bottom:8px}}
         .footer{{margin-top:14px;font-size:12px;color:var(--muted)}}
         .footer a{{color:var(--brand);text-decoration:none}}
-        @media (max-width:760px){{.wrap{{width:calc(100vw - 12px)}}.hero,.card{{border-radius:18px;padding:14px}}.layout{{grid-template-columns:1fr}}.grid{{grid-template-columns:1fr 1fr}}}}
-        @media (max-width:520px){{.grid{{grid-template-columns:1fr}}.hero .route{{font-size:20px}}}}
+        @media (max-width:760px){{.wrap{{padding:8px 8px 18px}}.hero,.card{{border-radius:18px;padding:14px}}.grid{{grid-template-columns:1fr 1fr}}.hero h1{{font-size:28px}}.hero .route{{font-size:20px}}.price{{font-size:34px}}}}
+        @media (max-width:520px){{.grid{{grid-template-columns:1fr}}}}
       </style>
     </head>
     <body>
@@ -1270,22 +1400,23 @@ def build_pushplus_contents(
           <title>{html_text(title)}</title>
           <style>
             :root {{--line:#e8edf5;--text:#1f2937;--muted:#667085;--brand:#2563eb;--accent:#f97316;}}
+            html,body {{width:100%;margin:0;padding:0}}
             * {{box-sizing:border-box}}
-            body {{margin:0;background:#f5f7fb;color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}}
-            .wrap {{width:min(1440px,calc(100vw - 20px));margin:0 auto;padding:12px 0 24px}}
+            body {{background:#f5f7fb;color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}}
+            .wrap {{width:100%;max-width:980px;margin:0 auto;padding:12px 12px 24px}}
             .hero {{
-              background:#2563eb;color:#fff;border-radius:20px;padding:18px;
+              width:100%;margin:0 auto;background:#2563eb;color:#fff;border-radius:20px;padding:18px;
             }}
-            .hero h1 {{margin:0 0 8px;font-size:clamp(24px,4vw,34px);line-height:1.2}}
+            .hero h1 {{margin:0 0 8px;font-size:32px;line-height:1.2}}
             .hero p {{margin:4px 0;font-size:13px;opacity:.94}}
             .part-badge {{margin-top:8px;display:inline-block;padding:5px 9px;border-radius:999px;background:rgba(255,255,255,.18);font-size:12px}}
             .route-section {{
-              margin-top:14px;background:#fff;border:1px solid var(--line);border-radius:20px;padding:14px;
+              width:100%;margin:14px auto 0;background:#fff;border:1px solid var(--line);border-radius:20px;padding:14px;
             }}
             .route-header {{
               display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:12px;
             }}
-            .route-header h2 {{margin:4px 0 0;font-size:clamp(20px,3vw,28px)}}
+            .route-header h2 {{margin:4px 0 0;font-size:28px}}
             .route-date {{font-size:12px;color:var(--brand);font-weight:700}}
             .route-meta {{
               display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;
@@ -1309,17 +1440,17 @@ def build_pushplus_contents(
               background:#eff6ff;border:1px solid #93c5fd;color:#1d4ed8;
             }}
             .ticket-grid {{
-              display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px;
+              display:flex;flex-direction:column;gap:12px;width:100%;
             }}
             .ticket-card {{
-              position:relative;background:#fff;border:1px solid var(--line);border-radius:16px;padding:14px;min-height:100%;
+              width:100%;max-width:100%;margin:0 auto;position:relative;background:#fff;border:1px solid var(--line);border-radius:16px;padding:14px;min-height:100%;
             }}
             .ticket-order {{position:absolute;top:12px;right:12px;font-size:12px;color:var(--muted)}}
             .ticket-main {{margin-bottom:10px;padding-right:32px}}
-            .ticket-time {{font-size:clamp(24px,5vw,34px);line-height:1.05;font-weight:800;color:var(--brand)}}
+            .ticket-time {{font-size:32px;line-height:1.05;font-weight:800;color:var(--brand)}}
             .ticket-route {{margin-top:4px;font-size:15px;font-weight:700;color:var(--text)}}
             .ticket-price {{
-              font-size:clamp(28px,6vw,36px);line-height:1;font-weight:800;color:var(--accent);margin-bottom:12px;
+              font-size:36px;line-height:1;font-weight:800;color:var(--accent);margin-bottom:12px;
             }}
             .ticket-row {{
               display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px dashed var(--line);
@@ -1341,9 +1472,15 @@ def build_pushplus_contents(
               padding:18px;border-radius:12px;background:#f8fafc;border:1px dashed var(--line);color:var(--muted);
             }}
             @media (max-width: 640px) {{
-              .wrap {{width:calc(100vw - 12px)}}
+              .wrap {{padding:8px 8px 18px}}
               .hero,.route-section,.ticket-card {{border-radius:14px;padding:12px}}
+              .hero h1 {{font-size:24px}}
+              .route-header h2 {{font-size:22px}}
+              .ticket-time {{font-size:24px}}
+              .ticket-price {{font-size:28px}}
               .route-meta {{justify-content:flex-start}}
+              .ticket-row {{flex-direction:column;align-items:flex-start}}
+              .ticket-row .value {{text-align:left}}
             }}
           </style>
         </head>
@@ -1555,6 +1692,10 @@ class CtripMonitor:
         self.playwright = None
         self.browser_cfg = config["browser"]
         self.city_lookup: dict[str, dict[str, Any]] = {}
+        cookie_file = Path(str(config.get("cookie_file") or DEFAULT_COOKIE_PATH))
+        self.cookie_path = cookie_file
+        self.cookies = load_cookie_file(cookie_file)
+        self.http = build_ctrip_requests_session(self.cookies)
 
     async def __aenter__(self) -> "CtripMonitor":
         self.playwright = await async_playwright().start()
@@ -1574,6 +1715,11 @@ class CtripMonitor:
                 "height": int(self.browser_cfg.get("viewport_height", 720)),
             },
         )
+        if self.cookies:
+            await self.context.add_cookies(self.cookies)
+            safe_output(f"已加载携程登录 Cookie：{self.cookie_path}（{len(self.cookies)} 条）")
+        else:
+            safe_output("未检测到 cookie.json，将以未登录状态抓取；若要抓取完整航班列表，请提供导出的携程登录 Cookie。")
         await self.context.add_init_script(INIT_SCRIPT)
         return self
 
@@ -1584,6 +1730,7 @@ class CtripMonitor:
             await self.browser.close()
         if self.playwright:
             await self.playwright.stop()
+        self.http.close()
 
     async def _load_city_lookup(self) -> None:
         if self.city_lookup:
@@ -2208,15 +2355,30 @@ async def collect_route_results(
         url, payload, display_rows = await monitor.fetch_route_payload(route)
         tickets, parser_mode = resolve_ctrip_tickets(route, payload, display_rows)
         if not tickets:
+            repo_lowest_price: int | None = None
             try:
-                lowest_price_payload = fetch_ctrip_lowest_price_payload(route)
+                repo_lowest_payload = fetch_ctrip_repo_lowest_price_payload(route, monitor.http)
+            except requests.RequestException as exc:
+                safe_output(
+                    f"警告：参考仓库同源的 12808 日历价接口请求失败："
+                    f"{route['departure_city']} -> {route['arrival_city']} {route['departure_date']} | {exc}"
+                )
+            else:
+                repo_lowest_price = extract_ctrip_repo_lowest_price(route, repo_lowest_payload)
+
+            try:
+                lowest_price_payload = fetch_ctrip_lowest_price_payload(route, monitor.http)
             except requests.RequestException as exc:
                 safe_output(
                     f"警告：携程日历最低价接口请求失败，仍按空结果处理："
                     f"{route['departure_city']} -> {route['arrival_city']} {route['departure_date']} | {exc}"
                 )
             else:
-                lowest_price_tickets = parse_ctrip_lowest_price_tickets(route, lowest_price_payload)
+                lowest_price_tickets = parse_ctrip_lowest_price_tickets(
+                    route,
+                    lowest_price_payload,
+                    price_override=repo_lowest_price,
+                )
                 if lowest_price_tickets:
                     safe_output(
                         f"提示：航班列表为空，已改用携程日历最低价接口："
@@ -2224,6 +2386,13 @@ async def collect_route_results(
                     )
                     tickets = lowest_price_tickets
                     parser_mode = "lowest_price"
+            if not tickets and repo_lowest_price is not None:
+                safe_output(
+                    f"提示：已改用参考仓库同源的 12808 日历价接口："
+                    f"{route['departure_city']} -> {route['arrival_city']} {route['departure_date']}"
+                )
+                tickets = [build_ctrip_lowest_price_ticket(route, price=repo_lowest_price, extra_labels=["来自 12808 日历价接口"])]
+                parser_mode = "lowest_price_12808"
         update_price_history(history, config, route, tickets, current_time)
         matched_tickets = filter_tickets_for_route(route, tickets)
         results.append(
@@ -2434,13 +2603,20 @@ async def run_service(config: dict[str, Any], dry_run: bool, dump_json: bool) ->
                 notification_items = build_notification_items(config, route_results, history, now)
                 title = current_title(now)
                 should_push = bool(notification_items)
+                push_results: list[dict[str, Any]] = []
+                onebot_results: list[dict[str, Any]] = []
+                email_results: list[dict[str, Any]] = []
                 if should_push and not dry_run:
-                    send_pushplus_notifications(config["pushplus"], notification_items)
+                    push_results = send_pushplus_notifications(config["pushplus"], notification_items)
                     if onebot_cfg.get("enabled") and notification_items:
-                        send_onebot_messages(onebot_cfg, [item["onebot_message"] for item in notification_items])
+                        onebot_results = send_onebot_messages(
+                            onebot_cfg,
+                            [item["onebot_message"] for item in notification_items],
+                        )
                     if email_cfg.get("enabled"):
+                        email_results = []
                         for item in notification_items:
-                            send_resend_email(email_cfg, item["title"], item["html"], item["text"])
+                            email_results.append(send_resend_email(email_cfg, item["title"], item["html"], item["text"]))
                 elif not should_push:
                     safe_output(f"{title}: no tickets below the expected price, skipped push.")
 
@@ -2457,6 +2633,9 @@ async def run_service(config: dict[str, Any], dry_run: bool, dump_json: bool) ->
                             {
                                 "title": title,
                                 "due_slots": [occurrence.slot for occurrence in due_slots],
+                                "push_results": push_results,
+                                "onebot_results": onebot_results,
+                                "email_results": email_results,
                                 "route_results": serialize_route_results(route_results),
                                 "notification_count": len(notification_items),
                             },

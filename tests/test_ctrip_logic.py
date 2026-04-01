@@ -1,6 +1,8 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import flight_monitor
@@ -26,6 +28,56 @@ class CtripRouteParsingTests(unittest.TestCase):
             url,
             "https://flights.ctrip.com/online/list/oneway-bjs-sha?depdate=2026-04-15&cabin=y_s_c_f&adult=1&child=0&infant=0",
         )
+
+    def test_build_ctrip_repo_lowest_price_params_uses_city_codes(self) -> None:
+        route = {
+            "departure_city_code": "BJS",
+            "arrival_city_code": "SHA",
+        }
+        params = flight_monitor.build_ctrip_repo_lowest_price_params(route)
+        self.assertEqual(
+            params,
+            {
+                "flightWay": "Oneway",
+                "dcity": "BJS",
+                "acity": "SHA",
+                "direct": "false",
+                "army": "false",
+            },
+        )
+
+
+class CookieLoadingTests(unittest.TestCase):
+    def test_load_cookie_file_supports_cookie_editor_export(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            cookie_path = Path(tmpdir) / "cookie.json"
+            cookie_path.write_text(
+                """
+[
+  {
+    "domain": ".ctrip.com",
+    "expirationDate": 1777611836.667059,
+    "hostOnly": false,
+    "httpOnly": false,
+    "name": "IsNonUser",
+    "path": "/",
+    "sameSite": "no_restriction",
+    "secure": true,
+    "session": false,
+    "value": "F"
+  }
+]
+                """.strip(),
+                encoding="utf-8",
+            )
+
+            cookies = flight_monitor.load_cookie_file(cookie_path)
+
+        self.assertEqual(len(cookies), 1)
+        self.assertEqual(cookies[0]["name"], "IsNonUser")
+        self.assertEqual(cookies[0]["domain"], ".ctrip.com")
+        self.assertEqual(cookies[0]["sameSite"], "None")
+        self.assertTrue(cookies[0]["secure"])
 
 
 class CtripPayloadParsingTests(unittest.TestCase):
@@ -155,6 +207,25 @@ class CtripPayloadParsingTests(unittest.TestCase):
 
 
 class CtripLowestPriceParsingTests(unittest.TestCase):
+    def test_extract_ctrip_repo_lowest_price_reads_target_day(self) -> None:
+        route = {
+            "departure_date": "2026-04-15",
+        }
+        payload = {
+            "data": {
+                "oneWayPrice": [
+                    {
+                        "20260414": 520,
+                        "20260415": 480,
+                    }
+                ]
+            }
+        }
+
+        price = flight_monitor.extract_ctrip_repo_lowest_price(route, payload)
+
+        self.assertEqual(price, 480)
+
     def test_build_ctrip_lowest_price_payload_uses_codes_and_date(self) -> None:
         route = {
             "departure_city_code": "BJS",
@@ -169,8 +240,8 @@ class CtripLowestPriceParsingTests(unittest.TestCase):
 
     def test_parse_ctrip_lowest_price_tickets_extracts_target_date_price(self) -> None:
         route = {
-            "departure_city": "北京",
-            "arrival_city": "上海",
+            "departure_city": "\u5317\u4eac",
+            "arrival_city": "\u4e0a\u6d77",
             "departure_date": "2026-04-15",
         }
         payload = {
@@ -180,7 +251,7 @@ class CtripLowestPriceParsingTests(unittest.TestCase):
                     "price": 520,
                     "transportPrice": 480,
                     "totalPrice": 550,
-                    "directCalendarText": "直飞",
+                    "directCalendarText": "\u76f4\u98de",
                 },
                 {
                     "departDate": "/Date(1776268800000+0800)/",
@@ -195,11 +266,11 @@ class CtripLowestPriceParsingTests(unittest.TestCase):
 
         self.assertEqual(len(tickets), 1)
         self.assertEqual(tickets[0].price, 480)
-        self.assertEqual(tickets[0].flight_type, "日历最低价")
-        self.assertEqual(tickets[0].airlines, "携程日历价")
+        self.assertEqual(tickets[0].flight_type, "\u65e5\u5386\u6700\u4f4e\u4ef7")
+        self.assertEqual(tickets[0].airlines, "\u643a\u7a0b\u65e5\u5386\u4ef7")
         self.assertEqual(tickets[0].flight_numbers, "LOWEST-PRICE")
-        self.assertIn("日历最低价", tickets[0].labels)
-        self.assertIn("含税约￥550", tickets[0].labels)
+        self.assertIn("\u65e5\u5386\u6700\u4f4e\u4ef7", tickets[0].labels)
+        self.assertIn("\u542b\u7a0e\u7ea6\uffe5550", tickets[0].labels)
 
 
 class CtripTicketResolutionTests(unittest.TestCase):

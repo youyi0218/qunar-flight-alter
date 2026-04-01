@@ -5,10 +5,10 @@ A Ctrip-based flight price monitor. You only need to fill routes in `config.json
 ## Features
 
 - Config-only workflow; no `url.txt` maintenance
-- No Cookie / CK login required
+- Supports exported cookie.json login cookies for full itinerary crawling; if cookies are missing or expired, the program falls back automatically
 - Auto-resolves Ctrip domestic city code and city ID from the live site
 - Builds the Ctrip one-way list URL from `departure_city`, `arrival_city`, and `departure_date`
-- Uses itinerary API data first, falls back to DOM parsing, and finally falls back to the Ctrip lowest-price calendar API when only route/date pricing is available
+- Uses itinerary API data first, falls back to DOM parsing, and finally falls back to Ctrip lowest-price APIs (12808/lowestPrice and calendar pricing) when only route/date pricing is available
 - Keeps price history and shows recent price movement
 - Supports PushPlus HTML notifications
 - Supports Resend email notifications
@@ -34,6 +34,10 @@ cp config.example.json config.json
 ```
 
 4. Edit `config.json`
+
+### Optional login cookie
+
+If you export your logged-in Ctrip cookies to `cookie.json` in the project root, the crawler will load them automatically before opening the flight page. This is recommended because the logged-in itinerary API returns full flight details more reliably.
 
 ## Config
 
