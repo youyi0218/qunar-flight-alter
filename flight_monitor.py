@@ -13,7 +13,6 @@ from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -34,9 +33,13 @@ DEFAULT_BROWSER_PATHS = [
     Path("/usr/bin/google-chrome-stable"),
 ]
 PUSHPLUS_URL = "https://www.pushplus.plus/send"
-DEFAULT_URL_FILE = Path("url.txt")
+CTRIP_HOME_URL = "https://flights.ctrip.com/online/channel/domestic"
 CTRIP_BATCH_SEARCH_KEYWORD = "/search/api/search/batchSearch"
-CTRIP_DOMESTIC_PATH_RE = re.compile(r"/oneway-([a-z]{3})-([a-z]{3})(?:$|[/?])", re.IGNORECASE)
+CTRIP_LOWEST_PRICE_URL = "https://m.ctrip.com/restapi/soa2/15380/bjjson/FlightIntlAndInlandLowestPriceSearch"
+CTRIP_CITY_SELECTOR_REMARK_RE = re.compile(
+    r"选择城市\[(?P<display>[^|]+)\|(?P<label>[^|]+)\((?P<code>[A-Z]{3})\)\|(?P<city_id>\d+)\|(?P<url_code>[A-Z]{3})\]"
+)
+CTRIP_MS_DATE_RE = re.compile(r"/Date\((?P<ms>-?\d+)(?:[+-]\d+)?\)/")
 
 INIT_SCRIPT = r"""
 (() => {
@@ -52,6 +55,69 @@ INIT_SCRIPT = r"""
   try {
     Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
   } catch (_) {}
+
+  const state = {
+    requests: [],
+  };
+  window.__flightMonitor = state;
+
+  const captureResponse = (meta, status, responseText) => {
+    state.requests.push({
+      url: meta.url || '',
+      method: meta.method || '',
+      body: meta.body || '',
+      headers: meta.headers || {},
+      status: status || 0,
+      responseText: responseText || '',
+      ts: Date.now(),
+    });
+  };
+
+  const originalOpen = XMLHttpRequest.prototype.open;
+  const originalSend = XMLHttpRequest.prototype.send;
+  const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+
+  XMLHttpRequest.prototype.open = function(method, url) {
+    this.__flightMonitorMeta = { method, url, headers: {} };
+    return originalOpen.apply(this, arguments);
+  };
+
+  XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+    if (this.__flightMonitorMeta) {
+      this.__flightMonitorMeta.headers[name] = value;
+    }
+    return originalSetRequestHeader.apply(this, arguments);
+  };
+
+  XMLHttpRequest.prototype.send = function(body) {
+    const meta = this.__flightMonitorMeta || { headers: {} };
+    meta.body = typeof body === 'string' ? body : '';
+    this.addEventListener('loadend', function() {
+      let responseText = '';
+      try {
+        responseText = this.responseText || '';
+      } catch (_) {}
+      captureResponse(meta, this.status, responseText);
+    });
+    return originalSend.apply(this, arguments);
+  };
+
+  const originalFetch = window.fetch;
+  window.fetch = async function(input, init) {
+    const meta = {
+      method: (init && init.method) || (input && input.method) || 'GET',
+      url: typeof input === 'string' ? input : ((input && input.url) || ''),
+      headers: (init && init.headers) || {},
+      body: (init && typeof init.body === 'string') ? init.body : '',
+    };
+    const response = await originalFetch.apply(this, arguments);
+    try {
+      const cloned = response.clone();
+      const responseText = await cloned.text();
+      captureResponse(meta, response.status, responseText);
+    } catch (_) {}
+    return response;
+  };
 
 })();
 """
@@ -188,8 +254,6 @@ def ensure_config(path: Path) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise ValueError("config.json 必须是 JSON 对象")
 
-    config.setdefault("cookie_file", "cookie.json")
-    config.setdefault("url_file", str(DEFAULT_URL_FILE))
     config.setdefault("state_file", ".flight_monitor_state.json")
     config.setdefault("history_file", ".flight_monitor_history.json")
     config.setdefault("notify_empty_results", True)
@@ -280,159 +344,64 @@ def detect_browser_executable(config: dict[str, Any]) -> str:
     raise FileNotFoundError("未找到可用的浏览器，请在 config.json.browser.executable_path 中指定 Chromium/Chrome 路径")
 
 
-def load_cookies(cookie_file: Path) -> list[dict[str, Any]]:
-    if not cookie_file or str(cookie_file) in {"", "."} or not cookie_file.exists() or not cookie_file.is_file():
-        return []
-    cookies = load_json(cookie_file)
-    if not isinstance(cookies, list):
-        raise ValueError("cookie.json 必须是 JSON 数组")
-    cleaned: list[dict[str, Any]] = []
-    for item in cookies:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("name")
-        value = item.get("value")
-        domain = item.get("domain")
-        if not name or value is None or not domain:
-            continue
-        cookie: dict[str, Any] = {
-            "name": name,
-            "value": str(value),
-            "domain": str(domain),
-            "path": str(item.get("path") or "/"),
-            "httpOnly": bool(item.get("httpOnly", False)),
-            "secure": bool(item.get("secure", False)),
-        }
-        expiration = item.get("expirationDate")
-        if expiration:
-            try:
-                cookie["expires"] = int(float(expiration))
-            except (TypeError, ValueError):
-                pass
-        cleaned.append(cookie)
-    return cleaned
+def normalize_city_name(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip())
 
 
-def extract_url_from_text(text: str) -> str:
-    match = re.search(r"https?://\S+", text)
+def parse_city_selector_remark(remark: str) -> dict[str, Any]:
+    match = CTRIP_CITY_SELECTOR_REMARK_RE.search(str(remark or "").strip())
     if not match:
-        raise ValueError(f"未在文本中找到有效 URL: {text}")
-    return match.group(0).strip()
-
-
-def parse_prefixed_route_text(text: str) -> dict[str, str]:
-    prefix = text.split("http", 1)[0]
-    info: dict[str, str] = {}
-    patterns = {
-        "departure_city": r"出发[:：]\s*([^\s]+)",
-        "arrival_city": r"到达[:：]\s*([^\s]+)",
-        "departure_date_text": r"出发日期[:：]\s*([^\s]+)",
-    }
-    for key, pattern in patterns.items():
-        match = re.search(pattern, prefix)
-        if match:
-            info[key] = match.group(1).strip()
-    return info
-
-
-def parse_ctrip_url(url: str) -> dict[str, Any]:
-    parsed = urlparse(url.strip())
-    host = parsed.netloc.lower()
-    if "ctrip.com" not in host and "trip.com" not in host:
-        raise ValueError(f"不是携程机票链接: {url}")
-    match = CTRIP_DOMESTIC_PATH_RE.search(parsed.path)
-    if not match:
-        raise ValueError(f"暂不支持的携程机票链接格式: {url}")
-    query = parse_qs(parsed.query)
-    departure_date = (query.get("depdate") or [""])[0].strip()
-    if not departure_date:
-        raise ValueError(f"携程链接缺少 depdate 参数: {url}")
+        raise ValueError(f"无法解析携程城市标记: {remark}")
     return {
-        "source_url": url.strip(),
-        "departure_city_code": match.group(1).upper(),
-        "arrival_city_code": match.group(2).upper(),
-        "departure_date": departure_date,
+        "name": match.group("display").strip(),
+        "code": match.group("code").strip().upper(),
+        "city_id": int(match.group("city_id")),
     }
 
 
-def build_route_match_keys(route: dict[str, Any]) -> list[str]:
-    keys: list[str] = []
-    url = str(route.get("source_url") or route.get("url") or "").strip()
-    if url:
-        keys.append(f"url:{url}")
-    departure_date = str(route.get("departure_date") or "").strip()
-    departure_city = str(route.get("departure_city") or "").strip()
-    arrival_city = str(route.get("arrival_city") or "").strip()
-    departure_code = str(route.get("departure_city_code") or "").strip().upper()
-    arrival_code = str(route.get("arrival_city_code") or "").strip().upper()
-    if departure_city and arrival_city and departure_date:
-        keys.append(f"city:{departure_city}|{arrival_city}|{departure_date}")
-    if departure_code and arrival_code and departure_date:
-        keys.append(f"code:{departure_code}|{arrival_code}|{departure_date}")
-    return keys
+def iter_city_aliases(name: str) -> list[str]:
+    aliases = [normalize_city_name(name)]
+    if name.startswith("中国") and len(name) > 2:
+        aliases.append(normalize_city_name(name[2:]))
+    trimmed = re.sub(r"[（(].*?[)）]", "", name).strip()
+    if trimmed and normalize_city_name(trimmed) not in aliases:
+        aliases.append(normalize_city_name(trimmed))
+    return [alias for alias in aliases if alias]
 
 
-def merge_route_overrides(base_routes: list[dict[str, Any]], overrides: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    override_map: dict[str, dict[str, Any]] = {}
-    for item in overrides:
-        if not isinstance(item, dict):
-            continue
-        for key in build_route_match_keys(item):
-            override_map[key] = item
-
-    merged_routes: list[dict[str, Any]] = []
-    for route in base_routes:
-        merged = dict(route)
-        matched: dict[str, Any] | None = None
-        for key in build_route_match_keys(route):
-            matched = override_map.get(key)
-            if matched:
-                break
-        if matched:
-            for field, value in matched.items():
-                if field in {"url", "source_url"}:
-                    continue
-                merged[field] = value
-        merged.setdefault("expected_price", None)
-        merged.setdefault("enabled", True)
-        merged_routes.append(merged)
-    return merged_routes
+def build_ctrip_url(route: dict[str, Any]) -> str:
+    departure_code = str(route["departure_city_code"]).strip().lower()
+    arrival_code = str(route["arrival_city_code"]).strip().lower()
+    departure_date = str(route["departure_date"]).strip()
+    return (
+        f"https://flights.ctrip.com/online/list/oneway-{departure_code}-{arrival_code}"
+        f"?depdate={departure_date}&cabin=y_s_c_f&adult=1&child=0&infant=0"
+    )
 
 
-def load_routes_from_url_file(config: dict[str, Any]) -> list[dict[str, Any]]:
-    url_path = Path(str(config.get("url_file") or DEFAULT_URL_FILE))
-    if not url_path.exists():
-        raise FileNotFoundError(f"未找到 URL 文件: {url_path}")
-
-    routes: list[dict[str, Any]] = []
-    for raw_line in url_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        route = parse_ctrip_url(extract_url_from_text(line))
-        route.update(parse_prefixed_route_text(line))
-        route.setdefault("expected_price", None)
-        route.setdefault("enabled", True)
-        routes.append(route)
-
-    if not routes:
-        raise ValueError(f"{url_path} 中未找到有效的携程机票链接")
-    return merge_route_overrides(routes, config.get("routes", []))
+def build_ctrip_lowest_price_payload(route: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "departNewCityCode": str(route["departure_city_code"]).strip().upper(),
+        "arriveNewCityCode": str(route["arrival_city_code"]).strip().upper(),
+        "startDate": str(route["departure_date"]).strip(),
+        "grade": 15,
+        "flag": 0,
+        "channelName": "FlightOnline",
+        "searchType": 1,
+        "passengerList": [{"passengercount": 1, "passengertype": "Adult"}],
+        "calendarSelections": [{"selectionType": 8, "selectionContent": ["15"]}],
+    }
 
 
-def hydrate_route_from_search_request(route: dict[str, Any], request_payload: dict[str, Any]) -> None:
-    segments = request_payload.get("flightSegments") or []
-    segment = segments[0] if segments else {}
-    if not route.get("departure_city"):
-        route["departure_city"] = str(segment.get("departureCityName") or route.get("departure_city_code") or "").strip()
-    if not route.get("arrival_city"):
-        route["arrival_city"] = str(segment.get("arrivalCityName") or route.get("arrival_city_code") or "").strip()
-    if not route.get("departure_city_code"):
-        route["departure_city_code"] = str(segment.get("departureCityCode") or "").strip().upper()
-    if not route.get("arrival_city_code"):
-        route["arrival_city_code"] = str(segment.get("arrivalCityCode") or "").strip().upper()
-    if not route.get("departure_date"):
-        route["departure_date"] = str(segment.get("departureDate") or "").strip()
+def parse_ctrip_ms_date(value: Any) -> str:
+    match = CTRIP_MS_DATE_RE.search(str(value or "").strip())
+    if not match:
+        return ""
+    try:
+        dt = datetime.fromtimestamp(int(match.group("ms")) / 1000, ZoneInfo("Asia/Shanghai"))
+    except (ValueError, OSError):
+        return ""
+    return dt.strftime("%Y-%m-%d")
 
 
 def combine_airport(name: str | None, terminal: str | None) -> str:
@@ -910,6 +879,126 @@ def parse_ctrip_flights(route: dict[str, Any], payload: dict[str, Any]) -> list[
     tickets = [parse_ctrip_ticket(route, item) for item in itineraries if isinstance(item, dict)]
     tickets.sort(key=lambda item: (item.price, item.departure_time, item.arrival_time, item.flight_numbers))
     return tickets
+
+
+def parse_ctrip_lowest_price_tickets(route: dict[str, Any], payload: dict[str, Any]) -> list[Ticket]:
+    target_date = str(route.get("departure_date") or "").strip()
+    tickets: list[Ticket] = []
+    for item in payload.get("priceList") or []:
+        if not isinstance(item, dict):
+            continue
+        departure_date = parse_ctrip_ms_date(item.get("departDate"))
+        if departure_date != target_date:
+            continue
+        base_price_raw = item.get("transportPrice")
+        if base_price_raw in (None, ""):
+            base_price_raw = item.get("price")
+        try:
+            price = int(round(float(base_price_raw)))
+        except (TypeError, ValueError):
+            continue
+
+        total_price: int | None = None
+        try:
+            if item.get("totalPrice") not in (None, ""):
+                total_price = int(round(float(item.get("totalPrice"))))
+        except (TypeError, ValueError):
+            total_price = None
+
+        labels = ["日历最低价", "仅含日期价格，不含具体航班"]
+        direct_text = str(item.get("directCalendarText") or "").strip()
+        if direct_text:
+            labels.append(direct_text)
+        if total_price and total_price != price:
+            labels.append(f"含税约￥{total_price}")
+
+        tickets.append(
+            Ticket(
+                route=f"{route['departure_city']} → {route['arrival_city']}",
+                departure_city=route["departure_city"],
+                arrival_city=route["arrival_city"],
+                departure_date=target_date,
+                arrival_date=target_date,
+                arrival_day_offset=0,
+                flight_type="日历最低价",
+                airlines="携程日历价",
+                flight_numbers="LOWEST-PRICE",
+                departure_time="--:--",
+                arrival_time="--:--",
+                departure_airport=route["departure_city"],
+                arrival_airport=route["arrival_city"],
+                total_duration="",
+                flight_duration="",
+                transfer_city="",
+                transfer_duration="",
+                price=price,
+                discount="",
+                labels=dedupe_in_order(labels),
+                segments=[],
+            )
+        )
+    tickets.sort(key=lambda item: (item.price, item.departure_time, item.arrival_time, item.flight_numbers))
+    return tickets
+
+
+def fetch_ctrip_lowest_price_payload(route: dict[str, Any]) -> dict[str, Any]:
+    response = requests.post(
+        CTRIP_LOWEST_PRICE_URL,
+        json=build_ctrip_lowest_price_payload(route),
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+            ),
+            "Referer": str(route.get("source_url") or CTRIP_HOME_URL),
+            "Content-Type": "application/json",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def resolve_ctrip_tickets(
+    route: dict[str, Any],
+    payload: dict[str, Any],
+    display_rows: list[dict[str, Any]],
+) -> tuple[list[Ticket], str]:
+    status = int(payload.get("status", -1))
+
+    if status == 0:
+        tickets = parse_ctrip_flights(route, payload)
+        if tickets:
+            if display_rows:
+                apply_display_prices(tickets, display_rows)
+            return tickets, "api"
+
+        if display_rows:
+            safe_output(
+                "警告：携程接口返回 status=0，但 flightItineraryList 为空，"
+                f"已自动切换为页面 DOM 兜底解析：{route['departure_city']} -> "
+                f"{route['arrival_city']} {route['departure_date']}"
+            )
+            return parse_display_tickets(route, display_rows), "dom"
+
+        safe_output(
+            "警告：携程接口返回 status=0，但 flightItineraryList 为空，且页面未解析到机票卡片，"
+            f"按空结果处理：{route['departure_city']} -> {route['arrival_city']} {route['departure_date']}"
+        )
+        return [], "empty"
+
+    if display_rows:
+        safe_output(
+            f"警告：携程接口返回 status={status}，已自动切换为页面 DOM 兜底解析："
+            f"{route['departure_city']} -> {route['arrival_city']} {route['departure_date']}"
+        )
+        return parse_display_tickets(route, display_rows), "dom"
+
+    safe_output(
+        f"警告：携程接口返回 status={status}，且页面未解析到机票卡片，按空结果处理："
+        f"{route['departure_city']} -> {route['arrival_city']} {route['departure_date']}"
+    )
+    return [], "empty"
 
 
 def format_segment_line(segment: FlightSegment) -> str:
@@ -1458,14 +1547,14 @@ def send_resend_email(email_cfg: dict[str, Any], subject: str, html_content: str
 
 
 class CtripMonitor:
-    def __init__(self, config: dict[str, Any], cookie_file: Path) -> None:
+    def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
-        self.cookie_file = cookie_file
         self.browser_path = detect_browser_executable(config)
         self.browser: Browser | None = None
         self.context: BrowserContext | None = None
         self.playwright = None
         self.browser_cfg = config["browser"]
+        self.city_lookup: dict[str, dict[str, Any]] = {}
 
     async def __aenter__(self) -> "CtripMonitor":
         self.playwright = await async_playwright().start()
@@ -1486,9 +1575,6 @@ class CtripMonitor:
             },
         )
         await self.context.add_init_script(INIT_SCRIPT)
-        cookies = load_cookies(self.cookie_file)
-        if cookies:
-            await self.context.add_cookies(cookies)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -1498,6 +1584,77 @@ class CtripMonitor:
             await self.browser.close()
         if self.playwright:
             await self.playwright.stop()
+
+    async def _load_city_lookup(self) -> None:
+        if self.city_lookup:
+            return
+        if not self.context:
+            raise RuntimeError("浏览器上下文未初始化")
+
+        page = await self.context.new_page()
+        try:
+            await page.goto(CTRIP_HOME_URL, wait_until="domcontentloaded", timeout=90000)
+            await page.wait_for_timeout(1500)
+            await page.click(".flt-depart input", timeout=10000)
+            await page.wait_for_timeout(800)
+            tab_locator = page.locator(".city-picker-tabs").first.locator("li")
+            tab_count = await tab_locator.count()
+            lookup: dict[str, dict[str, Any]] = {}
+            for idx in range(tab_count):
+                await tab_locator.nth(idx).click()
+                await page.wait_for_timeout(250)
+                items = await page.locator(".city-picker-body .cities li").evaluate_all(
+                    """els => els.map(el => ({
+                        title: (el.getAttribute('title') || '').trim(),
+                        remark: (el.getAttribute('data-u_remark') || '').trim()
+                    }))"""
+                )
+                for item in items:
+                    title = str(item.get("title") or "").strip()
+                    remark = str(item.get("remark") or "").strip()
+                    if not title or not remark:
+                        continue
+                    try:
+                        info = parse_city_selector_remark(remark)
+                    except ValueError:
+                        continue
+                    info["name"] = title
+                    for alias in iter_city_aliases(title):
+                        lookup[alias] = info
+            if not lookup:
+                raise RuntimeError("未能从携程页面解析城市列表")
+            self.city_lookup = lookup
+        finally:
+            await page.close()
+
+    def _resolve_city_info(self, city_name: str) -> dict[str, Any]:
+        normalized = normalize_city_name(city_name)
+        if normalized in self.city_lookup:
+            return self.city_lookup[normalized]
+
+        suggestions = dedupe_in_order(
+            [
+                info["name"]
+                for alias, info in self.city_lookup.items()
+                if normalized and (normalized in alias or alias in normalized)
+            ]
+        )
+        suffix = f"；可尝试：{'、'.join(suggestions[:8])}" if suggestions else ""
+        raise ValueError(f"未找到携程支持的城市：{city_name}{suffix}")
+
+    async def prepare_route(self, route: dict[str, Any]) -> None:
+        if route.get("source_url") and route.get("departure_city_code") and route.get("arrival_city_code"):
+            return
+        await self._load_city_lookup()
+        departure = self._resolve_city_info(str(route.get("departure_city") or ""))
+        arrival = self._resolve_city_info(str(route.get("arrival_city") or ""))
+        route["departure_city"] = departure["name"]
+        route["arrival_city"] = arrival["name"]
+        route["departure_city_code"] = departure["code"]
+        route["arrival_city_code"] = arrival["code"]
+        route["departure_city_id"] = departure["city_id"]
+        route["arrival_city_id"] = arrival["city_id"]
+        route["source_url"] = build_ctrip_url(route)
 
     async def _handle_route(self, route) -> None:
         request = route.request
@@ -1558,6 +1715,32 @@ class CtripMonitor:
             })}"""
         )
 
+    async def _wait_for_flight_payload(self, page: Page) -> dict[str, Any]:
+        timeout_ms = max(60000, int(self.browser_cfg.get("wait_timeout_ms", 25000)) * 2)
+        poll_interval_ms = int(self.browser_cfg.get("poll_interval_ms", 500))
+        deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+        latest_payload: dict[str, Any] | None = None
+
+        while asyncio.get_running_loop().time() < deadline:
+            logs = await page.evaluate(
+                f"""() => ((window.__flightMonitor && window.__flightMonitor.requests) || []).filter(
+                    item => (item.url || '').includes('{CTRIP_BATCH_SEARCH_KEYWORD}')
+                )"""
+            )
+            for item in sorted(logs, key=lambda row: row.get("ts", 0), reverse=True):
+                try:
+                    payload = json.loads(item["responseText"])
+                except Exception:
+                    continue
+                latest_payload = payload
+                if int(payload.get("status", -1)) == 0:
+                    return payload
+            await page.wait_for_timeout(poll_interval_ms)
+
+        if latest_payload is not None:
+            return latest_payload
+        raise RuntimeError("未捕获到有效的携程 batchSearch 响应")
+
     async def _collect_display_prices(self, page: Page, target_count: int = 0) -> list[dict[str, Any]]:
         collected: dict[str, dict[str, Any]] = {}
         stale_rounds = 0
@@ -1598,12 +1781,8 @@ class CtripMonitor:
         url = str(route["source_url"])
         try:
             timeout_ms = max(60000, int(self.browser_cfg.get("wait_timeout_ms", 25000)) * 2)
-            async with page.expect_response(lambda response: CTRIP_BATCH_SEARCH_KEYWORD in response.url, timeout=timeout_ms) as response_info:
-                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            response = await response_info.value
-            request_payload = json.loads(response.request.post_data or "{}")
-            hydrate_route_from_search_request(route, request_payload)
-            payload = json.loads(await response.text())
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            payload = await self._wait_for_flight_payload(page)
             try:
                 await page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:
@@ -2001,9 +2180,15 @@ def mark_slot_sent(state: dict[str, Any], slot_key: str) -> None:
 
 
 def validate_runtime_config(config: dict[str, Any]) -> None:
-    url_file = Path(str(config.get("url_file") or DEFAULT_URL_FILE))
-    if not url_file.exists():
-        raise FileNotFoundError(f"未找到 URL 文件: {url_file}")
+    routes = config.get("routes", [])
+    if not isinstance(routes, list) or not routes:
+        raise ValueError("config.json 中 routes 不能为空")
+    for index, route in enumerate(routes, start=1):
+        if not isinstance(route, dict):
+            raise ValueError(f"config.json 中第 {index} 条 route 必须是 JSON 对象")
+        for field in ("departure_city", "arrival_city", "departure_date"):
+            if not str(route.get(field) or "").strip():
+                raise ValueError(f"config.json 中第 {index} 条 route 缺少字段: {field}")
     push_cfg = config["pushplus"]
     if not push_cfg.get("token"):
         raise ValueError("config.json 中 pushplus.token 不能为空")
@@ -2019,30 +2204,33 @@ async def collect_route_results(
     for route in config["routes"]:
         if not route.get("enabled", True):
             continue
+        await monitor.prepare_route(route)
         url, payload, display_rows = await monitor.fetch_route_payload(route)
-        status = int(payload.get("status", -1))
-        if status == 0:
-            tickets = parse_ctrip_flights(route, payload)
-            if display_rows:
-                apply_display_prices(tickets, display_rows)
-        elif display_rows:
-            safe_output(
-                f"警告：携程接口返回 status={status}，已自动切换为页面 DOM 兜底解析："
-                f"{route['departure_city']} -> {route['arrival_city']} {route['departure_date']}"
-            )
-            tickets = parse_display_tickets(route, display_rows)
-        else:
-            safe_output(
-                f"警告：携程接口返回 status={status}，且页面未解析到机票卡片，按空结果处理："
-                f"{route['departure_city']} -> {route['arrival_city']} {route['departure_date']}"
-            )
-            tickets = []
+        tickets, parser_mode = resolve_ctrip_tickets(route, payload, display_rows)
+        if not tickets:
+            try:
+                lowest_price_payload = fetch_ctrip_lowest_price_payload(route)
+            except requests.RequestException as exc:
+                safe_output(
+                    f"警告：携程日历最低价接口请求失败，仍按空结果处理："
+                    f"{route['departure_city']} -> {route['arrival_city']} {route['departure_date']} | {exc}"
+                )
+            else:
+                lowest_price_tickets = parse_ctrip_lowest_price_tickets(route, lowest_price_payload)
+                if lowest_price_tickets:
+                    safe_output(
+                        f"提示：航班列表为空，已改用携程日历最低价接口："
+                        f"{route['departure_city']} -> {route['arrival_city']} {route['departure_date']}"
+                    )
+                    tickets = lowest_price_tickets
+                    parser_mode = "lowest_price"
         update_price_history(history, config, route, tickets, current_time)
         matched_tickets = filter_tickets_for_route(route, tickets)
         results.append(
             {
                 "route": route,
                 "url": url,
+                "parser_mode": parser_mode,
                 "display_price_count": len(display_rows),
                 "tickets": tickets,
                 "matched_tickets": matched_tickets,
@@ -2109,6 +2297,7 @@ def serialize_route_results(route_results: list[dict[str, Any]]) -> list[dict[st
             {
                 "route": result["route"],
                 "url": result["url"],
+                "parser_mode": result.get("parser_mode", ""),
                 "ticket_count": result["ticket_count"],
                 "matched_count": result["matched_count"],
                 "tickets": [asdict(ticket) for ticket in result["tickets"]],
@@ -2128,13 +2317,12 @@ def push_contents(push_cfg: dict[str, Any], title: str, contents: list[str]) -> 
 
 async def run_monitor(config: dict[str, Any], dry_run: bool, dump_json: bool) -> list[dict[str, Any]]:
     validate_runtime_config(config)
-    config["routes"] = load_routes_from_url_file(config)
     history_file = Path(config.get("history_file", ".flight_monitor_history.json"))
     history = load_history(history_file)
     onebot_cfg = load_onebot_config()
     current_time = now_in_timezone(config)
 
-    async with CtripMonitor(config, Path(str(config.get("cookie_file") or ""))) as monitor:
+    async with CtripMonitor(config) as monitor:
         route_results = await collect_route_results(config, monitor, history, current_time)
 
     summary_title = current_title(current_time)
@@ -2188,7 +2376,6 @@ async def run_monitor(config: dict[str, Any], dry_run: bool, dump_json: bool) ->
 
 async def run_service(config: dict[str, Any], dry_run: bool, dump_json: bool) -> None:
     validate_runtime_config(config)
-    config["routes"] = load_routes_from_url_file(config)
     service_cfg = config.get("service", {})
     onebot_cfg = load_onebot_config()
     email_cfg = config.get("email", {})
@@ -2207,7 +2394,7 @@ async def run_service(config: dict[str, Any], dry_run: bool, dump_json: bool) ->
     slot_snapshots: dict[str, list[dict[str, Any]]] = {}
     captured_slot_keys: set[str] = set()
 
-    async with CtripMonitor(config, Path(str(config.get("cookie_file") or ""))) as monitor:
+    async with CtripMonitor(config) as monitor:
         while True:
             now = now_in_timezone(config)
             cleanup_sent_slots(state, config)

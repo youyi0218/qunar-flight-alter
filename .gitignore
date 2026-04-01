@@ -6,6 +6,7 @@ config.json
 cookie.json
 onebot-config.json
 temp_test_config.json
+url.txt
 .flight_monitor_history.json
 .flight_monitor_state.json
 
@@ -17,7 +18,6 @@ sample_*.html
 sample_*.json
 domestic_oneway_new.js
 pushplustoken.txt
-url.txt
 *.jpg
 *.jpeg
 

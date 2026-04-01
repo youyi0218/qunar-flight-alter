@@ -1,52 +1,44 @@
 # ctrip-flight-alter
 
-携程机票价格监控脚本。
+A Ctrip-based flight price monitor. You only need to fill routes in `config.json` with departure city, arrival city, and departure date. The program will resolve supported Ctrip cities, build the page URL internally, fetch prices, and send notifications when prices meet your threshold.
 
-## 功能
+## Features
 
-- 读取 `url.txt` 中的携程单程机票网页 URL
-- 自动识别 URL 中的出发地、到达地、出发日期，并与 `config.json.routes` 中的价格阈值匹配
-- 通过真实浏览器抓取携程机票列表，并用页面展示价格做校验
-- 识别航司、航班号、出发/到达时间、跨天到达、机场、总耗时、价格
-- 价格按从低到高排序
-- 每条行程一条通知
-- 命中预期价时：推送该行程下所有命中的机票
-- 未命中预期价时：推送提醒文案，并附带该行程最低价的 3 张机票
-- 支持 PushPlus HTML 推送 + Resend 邮件推送
-- 支持定时服务模式
+- Config-only workflow; no `url.txt` maintenance
+- No Cookie / CK login required
+- Auto-resolves Ctrip domestic city code and city ID from the live site
+- Builds the Ctrip one-way list URL from `departure_city`, `arrival_city`, and `departure_date`
+- Uses itinerary API data first, falls back to DOM parsing, and finally falls back to the Ctrip lowest-price calendar API when only route/date pricing is available
+- Keeps price history and shows recent price movement
+- Supports PushPlus HTML notifications
+- Supports Resend email notifications
+- Supports one-shot CLI mode and scheduled service mode
+- Supports Docker and Docker Compose deployment
 
-## 准备
+## Install
 
-1. 安装依赖
+1. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-2. 准备浏览器  
-   支持系统已安装的 Chromium / Chrome，也可在 `config.json -> browser.executable_path` 指定路径。
+2. Prepare a browser
 
-3. 准备 `url.txt`  
-   每行一个携程单程列表页 URL；前面可以保留备注文字，例如：
+Install Chromium or Chrome locally. If auto-detection fails, set `config.json -> browser.executable_path`.
 
-```text
-出发：海口 到达：武汉 出发日期：5月1日 https://flights.ctrip.com/online/list/oneway-hak-wuh?depdate=2026-05-01&cabin=y_s_c_f&adult=1&child=0&infant=0
-```
-
-4. 可选：导出携程 Cookie  
-   如果你希望复用登录态，可用浏览器插件 **Cookie-Editor** 导出到 `cookie.json`；不提供也能抓取公开机票页。
-
-5. 复制配置
+3. Copy the template
 
 ```bash
 cp config.example.json config.json
 ```
 
-## 配置
+4. Edit `config.json`
 
-主要修改：
+## Config
 
-- `url_file`
+Important fields:
+
 - `pushplus.token`
 - `email.api_key`
 - `email.from`
@@ -55,96 +47,78 @@ cp config.example.json config.json
 - `service.capture_lead_minutes`
 - `routes`
 
-说明：
+Each item in `routes` should contain:
 
-- `url_file` 指向 `url.txt`
-- `routes` 主要用于覆盖每条航线的 `expected_price` / `enabled`
-- `routes` 优先按 `source_url` 匹配；如果未提供 `source_url`，则按 `出发城市 + 到达城市 + 出发日期` 匹配 `url.txt` 中自动识别出的航线
+- `departure_city`
+- `arrival_city`
+- `departure_date`
+- `expected_price`
+- `enabled`
 
-标题格式：
+Example:
 
-```text
-当日日期 航程 机票日期
+```jsonc
+{
+  "departure_city": "YOUR_DEPARTURE_CITY",
+  "arrival_city": "YOUR_ARRIVAL_CITY",
+  "departure_date": "2026-12-31",
+  "expected_price": 500,
+  "enabled": true
+}
 ```
 
-例如：
+The program builds a Ctrip page URL like this internally:
 
 ```text
-03月31日 武汉→海口 2026-05-05
+https://flights.ctrip.com/online/list/oneway-bjs-sha?depdate=2026-04-15&cabin=y_s_c_f&adult=1&child=0&infant=0
 ```
 
-## 运行
+## Usage
 
-单次执行：
+Run once and send notifications:
 
 ```bash
 python flight_monitor.py
 ```
 
-仅抓取不推送：
+Dry run and print JSON only:
 
 ```bash
 python flight_monitor.py --dry-run --dump-json
 ```
 
-定时服务：
+Run as a scheduled service:
 
 ```bash
 python flight_monitor.py --service
 ```
 
-Service mode 会在配置的推送时间前预抓取价格，并在 `schedule_times` 对应时刻推送。
-
 ## Docker
 
-### 本地构建
+### Build locally
 
 ```bash
 docker build -t ctrip-flight-alter .
-docker run --rm \
-  --user root \
-  -v $(pwd):/app \
-  ctrip-flight-alter
+docker run --rm --user root -v $(pwd):/app ctrip-flight-alter
 ```
 
-### 使用 GitHub Actions 构建好的镜像部署
-
-工作流会构建并可推送镜像到：
+### Use the GitHub Actions image
 
 ```text
 ghcr.io/youyi0218/ctrip-flight-alter:latest
 ```
 
-拉取并运行：
+### Docker Compose
 
 ```bash
-docker pull ghcr.io/youyi0218/ctrip-flight-alter:latest
-docker run -d \
-  --name ctrip-flight-alter \
-  --restart unless-stopped \
-  --user root \
-  -v $(pwd):/app \
-  ghcr.io/youyi0218/ctrip-flight-alter:latest
+docker compose up -d
 ```
 
-### Docker Compose 部署
-
-仓库已提供 `docker-compose.yml`，会把**当前项目目录**整体映射到容器 `/app`。
-
-这些文件都会直接在项目根目录中读写：
-
-- `config.json`
-- `url.txt`
-- `cookie.json`
-- `.flight_monitor_history.json`
-- `.flight_monitor_state.json`
-
-如果当前目录里还没有程序文件，容器首次启动时会自动补出这些文件：
+## Main files
 
 - `flight_monitor.py`
-- `config.example.json`
-- `README.md`
 - `requirements.txt`
+- `config.example.json`
 - `docker-compose.yml`
 - `Dockerfile`
 - `.gitignore`
@@ -152,9 +126,7 @@ docker run -d \
 - `docker-entrypoint.sh`
 - `LICENSE`
 
-如果当前目录里没有 `config.json`，容器也会自动用 `config.example.json` 生成一份。
-
-首次部署：
+## Update image
 
 ```bash
 docker login ghcr.io -u youyi0218
@@ -162,37 +134,28 @@ docker compose pull
 docker compose up -d
 ```
 
-第一次启动后，你只需要：
+If you only changed local config:
 
 ```bash
-# 按需修改自动生成出来的 config.json
-# 再把 url.txt / cookie.json 放到当前目录（cookie 可选）
 docker compose restart
 ```
 
-查看日志：
+Check logs:
 
 ```bash
 docker compose logs -f
 ```
 
-停止：
+Stop service:
 
 ```bash
 docker compose down
 ```
 
-如果你的环境使用旧版命令，也可以把 `docker compose` 改成 `docker-compose`。
+## Debug
 
-容器默认启动命令：
+Recommended first check:
 
 ```bash
-python /app/flight_monitor.py --service --config /app/config.json
+python flight_monitor.py --dry-run --dump-json
 ```
-
-## GitHub Actions
-
-已提供 Docker 构建工作流：
-
-- `push`
-- `workflow_dispatch`

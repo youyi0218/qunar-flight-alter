@@ -27,12 +27,4 @@ if [ ! -e "$APP_DIR/config.json" ] && [ -e "$APP_DIR/config.example.json" ]; the
   cp "$APP_DIR/config.example.json" "$APP_DIR/config.json"
 fi
 
-if [ ! -e "$APP_DIR/url.txt" ]; then
-  echo "warning: /app/url.txt not found; please place your Ctrip flight URLs in url.txt." >&2
-fi
-
-if [ ! -e "$APP_DIR/cookie.json" ]; then
-  echo "warning: /app/cookie.json not found; continuing without Ctrip login cookies." >&2
-fi
-
 exec "$@"

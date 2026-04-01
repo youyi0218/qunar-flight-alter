@@ -1,46 +1,31 @@
 from __future__ import annotations
 
-import tempfile
 import unittest
-from pathlib import Path
+from unittest.mock import patch
 
 import flight_monitor
 
 
 class CtripRouteParsingTests(unittest.TestCase):
-    def test_parse_ctrip_url_extracts_codes_and_date(self) -> None:
-        route = flight_monitor.parse_ctrip_url(
-            'https://flights.ctrip.com/online/list/oneway-hak-wuh?depdate=2026-05-01&adult=1'
-        )
-        self.assertEqual(route['departure_city_code'], 'HAK')
-        self.assertEqual(route['arrival_city_code'], 'WUH')
-        self.assertEqual(route['departure_date'], '2026-05-01')
+    def test_parse_city_selector_remark_extracts_city_info(self) -> None:
+        parsed = flight_monitor.parse_city_selector_remark("\u9009\u62e9\u57ce\u5e02[\u5317\u4eac|\u5317\u4eac(BJS)|1|BJS]")
+        self.assertEqual(parsed["name"], "\u5317\u4eac")
+        self.assertEqual(parsed["code"], "BJS")
+        self.assertEqual(parsed["city_id"], 1)
 
-    def test_load_routes_from_url_file_merges_route_override(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            url_file = Path(tmpdir) / 'url.txt'
-            url_file.write_text(
-                '\u51fa\u53d1\uff1a\u6d77\u53e3 \u5230\u8fbe\uff1a\u6b66\u6c49 \u51fa\u53d1\u65e5\u671f\uff1a5\u67081\u65e5 https://flights.ctrip.com/online/list/oneway-hak-wuh?depdate=2026-05-01&adult=1\n',
-                encoding='utf-8',
-            )
-            config = {
-                'url_file': str(url_file),
-                'routes': [
-                    {
-                        'departure_city': '\u6d77\u53e3',
-                        'arrival_city': '\u6b66\u6c49',
-                        'departure_date': '2026-05-01',
-                        'expected_price': 950,
-                        'enabled': False,
-                    }
-                ],
-            }
-            routes = flight_monitor.load_routes_from_url_file(config)
-            self.assertEqual(len(routes), 1)
-            self.assertEqual(routes[0]['expected_price'], 950)
-            self.assertFalse(routes[0]['enabled'])
-            self.assertEqual(routes[0]['departure_city'], '\u6d77\u53e3')
-            self.assertEqual(routes[0]['arrival_city'], '\u6b66\u6c49')
+    def test_build_ctrip_url_uses_city_codes_and_date(self) -> None:
+        route = {
+            "departure_city": "\u5317\u4eac",
+            "arrival_city": "\u4e0a\u6d77",
+            "departure_city_code": "BJS",
+            "arrival_city_code": "SHA",
+            "departure_date": "2026-04-15",
+        }
+        url = flight_monitor.build_ctrip_url(route)
+        self.assertEqual(
+            url,
+            "https://flights.ctrip.com/online/list/oneway-bjs-sha?depdate=2026-04-15&cabin=y_s_c_f&adult=1&child=0&infant=0",
+        )
 
 
 class CtripPayloadParsingTests(unittest.TestCase):
@@ -167,6 +152,98 @@ class CtripPayloadParsingTests(unittest.TestCase):
         self.assertEqual(tickets[1].flight_type, '\u76f4\u98de')
         self.assertEqual(tickets[1].discount, '5.5\u6298')
         self.assertIn('\u6258\u8fd0\u884c\u674e\u989d20KG', tickets[1].labels)
+
+
+class CtripLowestPriceParsingTests(unittest.TestCase):
+    def test_build_ctrip_lowest_price_payload_uses_codes_and_date(self) -> None:
+        route = {
+            "departure_city_code": "BJS",
+            "arrival_city_code": "SHA",
+            "departure_date": "2026-04-15",
+        }
+        payload = flight_monitor.build_ctrip_lowest_price_payload(route)
+        self.assertEqual(payload["departNewCityCode"], "BJS")
+        self.assertEqual(payload["arriveNewCityCode"], "SHA")
+        self.assertEqual(payload["startDate"], "2026-04-15")
+        self.assertEqual(payload["searchType"], 1)
+
+    def test_parse_ctrip_lowest_price_tickets_extracts_target_date_price(self) -> None:
+        route = {
+            "departure_city": "北京",
+            "arrival_city": "上海",
+            "departure_date": "2026-04-15",
+        }
+        payload = {
+            "priceList": [
+                {
+                    "departDate": "/Date(1776182400000+0800)/",
+                    "price": 520,
+                    "transportPrice": 480,
+                    "totalPrice": 550,
+                    "directCalendarText": "直飞",
+                },
+                {
+                    "departDate": "/Date(1776268800000+0800)/",
+                    "price": 530,
+                    "transportPrice": 500,
+                    "totalPrice": 570,
+                }
+            ]
+        }
+
+        tickets = flight_monitor.parse_ctrip_lowest_price_tickets(route, payload)
+
+        self.assertEqual(len(tickets), 1)
+        self.assertEqual(tickets[0].price, 480)
+        self.assertEqual(tickets[0].flight_type, "日历最低价")
+        self.assertEqual(tickets[0].airlines, "携程日历价")
+        self.assertEqual(tickets[0].flight_numbers, "LOWEST-PRICE")
+        self.assertIn("日历最低价", tickets[0].labels)
+        self.assertIn("含税约￥550", tickets[0].labels)
+
+
+class CtripTicketResolutionTests(unittest.TestCase):
+    @patch("flight_monitor.safe_output")
+    def test_resolve_ctrip_tickets_falls_back_to_dom_when_api_is_empty(self, safe_output_mock) -> None:
+        route = {
+            "departure_city": "BEIJING",
+            "arrival_city": "SHANGHAI",
+            "departure_date": "2026-04-15",
+        }
+        payload = {
+            "status": 0,
+            "data": {
+                "flightItineraryList": [],
+            },
+        }
+        display_rows = [
+            {
+                "price": "512",
+                "airlines": "CHINA EASTERN",
+                "flight_numbers": "MU5101",
+                "departure_time": "07:30",
+                "arrival_time": "09:45",
+                "departure_airport": "PEK T2",
+                "arrival_airport": "SHA T2",
+                "range_text": "2h15m",
+                "arrival_day_note": "",
+                "transfer_city": "",
+                "transfer_duration": "",
+                "discount": "4.8x",
+                "labels": ["PROMO"],
+                "flight_type": "DIRECT",
+            }
+        ]
+
+        tickets, parser_mode = flight_monitor.resolve_ctrip_tickets(route, payload, display_rows)
+
+        self.assertEqual(parser_mode, "dom")
+        self.assertEqual(len(tickets), 1)
+        self.assertEqual(tickets[0].price, 512)
+        self.assertEqual(tickets[0].flight_numbers, "MU5101")
+        self.assertEqual(tickets[0].departure_airport, "PEK T2")
+        self.assertEqual(tickets[0].arrival_airport, "SHA T2")
+        safe_output_mock.assert_called_once()
 
 
 if __name__ == '__main__':
